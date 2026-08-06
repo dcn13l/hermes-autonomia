@@ -37,9 +37,44 @@ curl <span class="s">"http://147.15.103.217:5000/api/preview?url=https://github.
 <span class="c">#</span> }</code>
 <div class="pricing">
   <div class="tier"><h2>Free</h2><div class="price">$0 <span>/ forever</span></div><ul><li>100 requests / day</li><li>No key required</li><li>All endpoints</li></ul><a class="btn outline" href="http://147.15.103.217:5000/api/preview?url=https://example.com">Try it now</a></div>
-  <div class="tier pro"><h2>Pro</h2><div class="price">$5 <span>/ month</span></div><ul><li>50,000 requests / day</li><li>Priority parsing</li><li>Usage dashboard</li></ul><a class="btn pay" href="https://www.paypal.com/ncp/payment/XXXX" target="_blank">Pay $5/mo (PayPal)</a> <a class="btn outline" href="http://147.15.103.217:5000/api/key?email=you@example.com">Start 14-day trial</a></div>
+  <div class="tier pro"><h2>Pro</h2><div class="price">$5 <span>/ month</span></div><ul><li>50,000 requests / day</li><li>Priority parsing</li><li>Usage dashboard</li><li>Non-expiring API key</li></ul>
+    <form id="pro-form" onsubmit="return linkpeekSubscribe(event)" style="margin-top:0.75rem">
+      <input id="pro-email" type="email" placeholder="you@email.com" required style="width:100%;padding:0.55rem;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.9rem;margin-bottom:0.5rem">
+      <button class="btn pay" type="submit" style="width:100%">Get Pro — $5/mo via PayPal</button>
+    </form>
+    <div id="pro-result" style="display:none;margin-top:0.75rem;padding:0.9rem;border:1px solid var(--accent2);border-radius:8px;background:#0d2818;font-size:0.85rem"></div>
+    <a class="btn outline" href="http://147.15.103.217:5000/api/key?email=you@example.com" style="margin-top:0.5rem">Or start 14-day trial</a>
+  </div>
 </div>
 <p class="body-copy">Also try our <a href="http://147.15.103.217:5000/api/qr?text=hello">QR Code API</a> — generate QR codes in one call.</p>
 <div class="footer">Built and operated by an autonomous AI agent 24/7 on Oracle Cloud. <a href="https://github.com/dcn13l/hermes-autonomia">Source on GitHub</a></div>
+<script>
+// Self-serve Pro signup: calls /api/subscribe and renders the Pro API key + payment link.
+function linkpeekSubscribe(e){
+  e.preventDefault();
+  var email = document.getElementById('pro-email').value.trim();
+  var box   = document.getElementById('pro-result');
+  var btn   = e.target.querySelector('button');
+  btn.disabled = true; btn.textContent = 'Issuing your Pro key…';
+  fetch('/api/subscribe?email=' + encodeURIComponent(email))
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d.error){ box.style.display='block'; box.innerHTML = '⚠ ' + d.error; btn.disabled=false; btn.textContent='Get Pro — $5/mo via PayPal'; return; }
+      var r = d.result || d;
+      box.style.display='block';
+      box.innerHTML =
+        '<strong style="color:#3fb950">✓ Pro key issued</strong><br>' +
+        '<code style="margin:0.5rem 0;padding:0.6rem;font-size:0.8rem">' + (r.api_key||'') + '</code><br>' +
+        '<a class="btn pay" href="' + (r.pay_url||'#') + '" target="_blank" style="margin-top:0.5rem">Pay $' + (r.price_usd||5) + ' (' + (r.pay_method||'paypal') + ') →</a>' +
+        '<div style="margin-top:0.5rem;color:var(--muted);font-size:0.8rem">' + (r.instructions||'') + '</div>';
+      btn.disabled=false; btn.textContent='Get Pro — $5/mo via PayPal';
+    })
+    .catch(function(err){
+      box.style.display='block'; box.innerHTML = '⚠ request failed (' + err + ')';
+      btn.disabled=false; btn.textContent='Get Pro — $5/mo via PayPal';
+    });
+  return false;
+}
+</script>
 </body>
 </html>

@@ -102,6 +102,98 @@ def issue_trial_key(email: str) -> str:
     return key
 
 
+# ---------------------------------------------------------------------------
+# Pro key + self-serve subscription (the revenue path)
+# ---------------------------------------------------------------------------
+# Operator sets one (or both) of these env vars to a real hosted-payment URL.
+# Free to create, $0 monthly fee, only charges per transaction:
+#   * PayPal Me   : https://www.paypal.me/<username>       (no business needed)
+#   * Stripe      : https://buy.stripe.com/<link_id>       (Payment Link, free)
+PRO_PRICE_USD = float(os.environ.get("LINKPEEK_PRO_PRICE", "5"))
+PAYPAL_ME = os.environ.get("LINKPEEK_PAYPAL_ME", "").rstrip("/")
+STRIPE_LINK = os.environ.get("LINKPEEK_STRIPE_LINK", "").rstrip("/")
+
+
+def issue_pro_key(email: str) -> str:
+    """Mint a non-expiring Pro API key for an email. Returns the key string.
+
+    Idempotent: if this email already has a Pro key, return it (so resubmitting
+    the subscribe form after paying does not fork keys)."""
+    import secrets
+
+    email = (email or "").strip().lower()
+    if not email or "@" not in email:
+        raise ValueError("valid email required")
+    keys = _load_keys()
+    for k, v in keys.items():
+        if v.get("email") == email and v.get("plan") == "pro":
+            return k
+    key = "lp_pro_" + secrets.token_urlsafe(16)
+    keys[key] = {
+        "email": email,
+        "plan": "pro",
+        "issued": _utc_day(),
+        "expires_ts": 0,  # 0 = never expires
+        "paid": False,    # operator flips to True once they reconcile the PayPal/Stripe notification with this email
+        "source": "self_serve_subscribe",
+    }
+    _save_keys(keys)
+    return key
+
+
+def subscribe(email: str, host: str = "") -> dict:
+    """Self-serve Pro signup. Issues a Pro key and returns a payment link.
+
+    Returns a dict with: email, api_key, plan, price_usd, pay_url, pay_method,
+    instructions. The pay_url is whichever payment primitive the operator has
+    configured (PayPal Me or Stripe Payment Link). If neither is set, we fall
+    back to a mailto: link asking the user to email the operator — still a
+    working, $0-cost path that needs no third-party account."""
+    email = (email or "").strip().lower()
+    if not email or "@" not in email:
+        raise ValueError("valid email required")
+
+    api_key = issue_pro_key(email)
+
+    pay_url = ""
+    pay_method = ""
+    if STRIPE_LINK:
+        # Stripe Payment Link: append the customer email so reconciliation is automatic.
+        sep = "&" if "?" in STRIPE_LINK else "?"
+        pay_url = "{}{}prefilled_email={}".format(STRIPE_LINK, sep, urllib.parse.quote(email))
+        pay_method = "stripe"
+    elif PAYPAL_ME:
+        # PayPal Me: amount goes in the path, email shows up in the notification
+        # the operator receives — they match it against the subscribed email.
+        pay_url = "{}/{:.2f}".format(PAYPAL_ME, PRO_PRICE_USD)
+        pay_method = "paypal"
+    else:
+        # Last-resort $0 path: a mailto asking the buyer to email the operator.
+        pay_url = (
+            "mailto:linkpeek@localhost?subject=LinkPeek%20Pro%20${:.0f}/mo"
+            "&body=Email%3A%20{}%0AKey%3A%20{}%0APlease%20send%20payment%20instructions.".format(
+                PRO_PRICE_USD, urllib.parse.quote(email), api_key
+            )
+        )
+        pay_method = "manual_email"
+
+    return {
+        "email": email,
+        "api_key": api_key,
+        "plan": "pro",
+        "daily_limit": PRO_DAILY_LIMIT,
+        "price_usd": PRO_PRICE_USD,
+        "pay_url": pay_url,
+        "pay_method": pay_method,
+        "instructions": (
+            "1. Open pay_url and pay ${:.0f}.  2. Your Pro API key is already issued above. "
+            "3. Activation is manual — once we match your payment email to this key, "
+            "your daily quota jumps to {:,} requests/day. Until then your key gives you "
+            "the trial daily limit.".format(PRO_PRICE_USD, PRO_DAILY_LIMIT)
+        ),
+    }
+
+
 def _key_info(apikey: str) -> dict | None:
     if not apikey:
         return None

@@ -33,7 +33,14 @@ from urllib.error import URLError, HTTPError
 
 from flask import Flask, jsonify, request, g, send_file, Response
 
-from decorators import rate_limit, quota_echo, issue_trial_key, daily_totals, record_billing
+from decorators import (
+    rate_limit,
+    quota_echo,
+    issue_trial_key,
+    daily_totals,
+    record_billing,
+    subscribe,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__, static_folder=BASE_DIR, template_folder=BASE_DIR)
@@ -481,9 +488,30 @@ def api_key():
     return jsonify(key=key, trial_days=14, note="use ?key=<key> on /api/preview")
 
 
+@app.route("/api/subscribe")
+def api_subscribe():
+    """Self-serve Pro signup — issues a Pro API key and returns a payment link."""
+    email = (request.values.get("email") or "").strip()
+    try:
+        result = subscribe(email)
+    except ValueError as ve:
+        return jsonify(error=str(ve)), 400
+    return jsonify(result)
+
+
 @app.route("/api/health")
 def api_health():
-    return jsonify(ok=True, today=daily_totals())
+    from decorators import PAYPAL_ME, STRIPE_LINK, PRO_PRICE_USD
+    pay_method = "stripe" if STRIPE_LINK else ("paypal" if PAYPAL_ME else "manual_email")
+    return jsonify(
+        ok=True,
+        today=daily_totals(),
+        revenue={
+            "pro_price_usd": PRO_PRICE_USD,
+            "pay_method": pay_method,  # live when "stripe" or "paypal"
+            "subscribe_url": "/api/subscribe?email=…",
+        },
+    )
 
 
 if __name__ == "__main__":

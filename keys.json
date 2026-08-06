@@ -1,0 +1,26 @@
+{
+  "lp_pro_tX2GcAh5vYqA4ikd4AC4rg": {
+    "email": "test-buyer@example.com",
+    "plan": "pro",
+    "issued": "2026-08-06",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
+  },
+  "lp_pro_xOT44_WHPBjs_g_GWXbQLQ": {
+    "email": "pro-test@example.com",
+    "plan": "pro",
+    "issued": "2026-08-06",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
+  },
+  "lp_pro_fHW6auJmqQvk6HCQlCdzFQ": {
+    "email": "pro-real@example.com",
+    "plan": "pro",
+    "issued": "2026-08-06",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
+  }
+}

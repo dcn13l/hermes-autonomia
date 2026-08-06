@@ -1,2 +1,79 @@
-# Hermes Autonomia — Fable 5 Experiment
-Autonomous business agent running on Oracle VPS 24/7.
+# LinkPeek — autonomous-business revenue product
+
+Flask app. Two tiers (matches `decorators.py`):
+
+| Plan  | Daily limit  | Auth           | How to get                               |
+|-------|-------------|----------------|------------------------------------------|
+| Free  | 100 / day   | none (per-IP)  | just call `/api/preview?url=…`           |
+| Pro   | 50,000 / day | API key        | `GET /api/subscribe?email=you@mail.com`  |
+| Trial | 50,000 / day | API key        | `GET /api/key?email=you@mail.com` (14d)  |
+
+## Endpoints
+- `GET /api/preview?url=` — link preview JSON (title/description/og:image/favicon)
+- `GET /api/qr?text=` — QR code PNG
+- `GET /api/key?email=` — issue a 14-day **trial** API key
+- `GET /api/subscribe?email=` — **revenue path**: mints a **Pro** API key (never
+  expires, persisted to `keys.json`) and returns a self-serve **payment link**.
+  Response includes `api_key`, `pay_url`, `pay_method`, `price_usd`, `instructions`.
+- `GET /api/health` — `{ok, today:{day, count}}`
+
+The Pro key works immediately at `/api/preview?key=<pro_key>` — `quota.limit`
+jumps to 50,000. `paid:false` in `keys.json` is a reconciliation flag the operator
+flips to `true` once the corresponding PayPal/Stripe notification arrives; the
+key *already works* before then so the buyer gets value instantly.
+
+## Turning on real payments ($0 budget, free to start)
+
+`/api/subscribe` picks the first of these env vars that is set on the
+`linkpeek.service` systemd unit and returns it as `pay_url`:
+
+| Env var                 | Value to set                                 | Cost     |
+|-------------------------|----------------------------------------------|----------|
+| `LINKPEEK_STRIPE_LINK`  | `https://buy.stripe.com/<payment_link_id>`   | free to create, fee only on a sale |
+| `LINKPEEK_PAYPAL_ME`    | `https://www.paypal.me/<your-username>`      | free to open (PayPal account) — no business account needed |
+| *(neither set)*         | —                                            | `pay_method` falls back to `manual_email` (a `mailto:` to the operator). Still a working $0 path. |
+
+Optional: `LINKPEEK_PRO_PRICE` (default `5`) — the monthly price in USD; used in
+the PayPal Me URL (`paypal.me/u/5.00`) and the Stripe prefill.
+
+### To activate Stripe (no spend until a sale, free to open account)
+1. Sign up at https://dashboard.stripe.com/register (free; no card required).
+2. Dashboard → **Payment Links** → **Create** → recurring product "$5 / mo",
+   name it "LinkPeek Pro".
+3. Copy the resulting `https://buy.stripe.com/…` link.
+4. `sudo systemctl edit linkpeek.service` and add:
+   ```
+   [Service]
+   Environment="LINKPEEK_STRIPE_LINK=https://buy.stripe.com/your_link_id"
+   ```
+5. `sudo systemctl restart linkpeek.service` — `/api/subscribe` now returns
+   `pay_method:"stripe"` with `prefilled_email` appended for auto-reconciliation.
+
+### To activate PayPal Me (fastest, free)
+1. Sign up at https://www.paypal.com and grab a PayPal.Me link
+   (`https://www.paypal.me/<username>`). Personal account, no business needed.
+2. `sudo systemctl edit linkpeek.service`:
+   ```
+   [Service]
+   Environment="LINKPEEK_PAYPAL_ME=https://www.paypal.me/your-username"
+   ```
+3. `sudo systemctl restart linkpeek.service`.
+
+When a payment notification email arrives at the operator's inbox, find the row
+in `product/keys.json` whose `email` matches the buyer and set `"paid":true`.
+
+## Why this beats a RapidAPI listing (Option A comparison)
+RapidAPI lets you list an API for free (they take a % per subscription sold
+through the marketplace), then you publish a `POST /v1/preview` OpenAPI spec
+and wait for **marketplace discovery** — approval is manual and traffic is
+mostly internal search. Option B (this implementation) delivers revenue today:
+a visitor hits `/api/subscribe`, gets a working Pro API key in the response,
+and is sent straight to a hosted payment page. No listing review, no marketplace
+cut, no per-transaction discovery lag. RapidAPI remains a worthwhile *secondary*
+distribution channel once we have a production-ready spec.
+
+## Ops
+- systemd unit: `/etc/systemd/system/linkpeek.service`
+- nginx (public port 80) proxies → `127.0.0.1:5000` (the systemd app)
+- `keys.json` (Pro/trial keys, persisted) — back this up; it is the customer record.
+- `ledger_billable.md` — one row per billable call (the accounting ledger).

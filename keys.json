@@ -75,5 +75,42 @@
     "expires_ts": 0,
     "paid": false,
     "source": "self_serve_subscribe"
+  },
+  "lp_pro_SqHgBRKz-kqo-Qclx36xHA": {
+    "email": "verifytest@example.com",
+    "plan": "pro",
+    "issued": "2026-08-06",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
+  },
+  "lp_pro_xayTKkewPkC89oIiRLA62A": {
+    "email": "test-research@example.com",
+    "plan": "pro",
+    "issued": "2026-08-06",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
+  },
+  "lp_PAGfnvJIMMq9K0HqWtEwgw": {
+    "email": "test2@example.com",
+    "plan": "trial",
+    "issued": "2026-08-06",
+    "expires": "2026-08-20",
+    "expires_ts": 1787255619
+  },
+  "lp_RldxUbljZbjbrN8dhNSGDQ": {
+    "email": "test3@example.com",
+    "plan": "trial",
+    "issued": "2026-08-06",
+    "expires": "2026-08-27",
+    "expires_ts": 1787860590
+  },
+  "lp_O8w2l8wgiv4mRfTTPvH3Ig": {
+    "email": "verify@example.com",
+    "plan": "trial",
+    "issued": "2026-08-06",
+    "expires": "2026-08-27",
+    "expires_ts": 1787860823
   }
 }

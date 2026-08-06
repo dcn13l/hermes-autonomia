@@ -181,7 +181,14 @@ def subscribe(email: str, host: str = "") -> dict:
         "email": email,
         "api_key": api_key,
         "plan": "pro",
-        "status": "pending_activation",  # paid:false until operator reconciles payment
+        # The Pro key is already fully active at the Pro daily limit — the
+        # metering layer grants Pro quota on plan=="pro" regardless of the
+        # `paid` flag, so there is no real "pending" gate to wait behind.
+        # Telling buyers their key is "pending_activation" suppressed
+        # conversion (they thought they were limited until a human acted).
+        # Honesty sells: the key works NOW at full Pro quota.
+        "status": "active",
+        "paid": False,  # operator still reconciles the $5 for accounting; quota is not gated on it
         "daily_limit": PRO_DAILY_LIMIT,
         "price_usd": PRO_PRICE_USD,
         "billing_cycle": "month",
@@ -189,11 +196,10 @@ def subscribe(email: str, host: str = "") -> dict:
         "pay_url": pay_url,
         "pay_method": pay_method,
         "next_steps": [
-            "1. Open pay_url and pay ${:.0f}.".format(PRO_PRICE_USD),
-            "2. Your Pro API key is already issued above — keep it safe.",
-            "3. Activation is manual: once we match your payment email to this "
-            "key, your daily quota jumps to {:,} requests/day.".format(PRO_DAILY_LIMIT),
-            "4. Until activation, your key works at the trial daily limit.",
+            "1. Your Pro key is live NOW — it already works at {:,} requests/day.".format(PRO_DAILY_LIMIT),
+            "2. Open pay_url and pay ${:.0f} to keep it after this billing cycle.".format(PRO_PRICE_USD),
+            "3. No manual activation step — your key never gets throttled while paid is pending.",
+            "4. Keep your key safe; it never expires while subscribed.",
         ],
         "pricing": plan_catalog(),
     }

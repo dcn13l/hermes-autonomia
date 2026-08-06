@@ -5,158 +5,41 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>LinkPeek — Link previews in one JSON call</title>
 <style>
-:root {
-  --bg: #0d1117;
-  --card: #161b22;
-  --border: #30363d;
-  --text: #e6edf3;
-  --muted: #8b949e;
-  --accent: #2f81f7;
-  --accent2: #238636;
-  --code-bg: #0a0e14;
-}
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-  background: var(--bg);
-  color: var(--text);
-  line-height: 1.6;
-  padding: 2rem 1rem;
-  max-width: 820px;
-  margin: 0 auto;
-}
-h1 {
-  font-size: 2.4rem;
-  letter-spacing: -0.03em;
-  margin-bottom: 0.5rem;
-}
-h1 .accent { color: var(--accent); }
-.tagline {
-  font-size: 1.15rem;
-  color: var(--muted);
-  margin-bottom: 2rem;
-}
-.body-copy {
-  color: var(--muted);
-  margin-bottom: 2rem;
-  font-size: 1rem;
-}
-.body-copy strong { color: var(--text); font-weight: 600; }
-code {
-  font-family: 'SF Mono', 'Fira Code', Consolas, Monaco, monospace;
-  background: var(--code-bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 1rem;
-  display: block;
-  overflow-x: auto;
-  font-size: 0.85rem;
-  color: #c9d1d9;
-  white-space: pre;
-  margin-bottom: 2rem;
-}
-code .k { color: #ff7b72; }
-code .s { color: #a5d6ff; }
-code .c { color: #8b949e; }
-code .u { text-decoration: underline; }
-.pricing {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 1rem;
-  margin-bottom: 2rem;
-}
-.tier {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 1.25rem;
-}
-.tier.pro { border-color: var(--accent2); }
-.tier h2 { font-size: 1.1rem; margin-bottom: 0.5rem; }
-.tier .price { font-size: 1.6rem; font-weight: 700; margin-bottom: 0.25rem; }
-.tier .price span { font-size: 0.9rem; color: var(--muted); font-weight: 400; }
-.tier ul { list-style: none; color: var(--muted); font-size: 0.9rem; }
-.tier ul li::before { content: "✓ "; color: var(--accent2); }
-.btn {
-  display: inline-block;
-  background: var(--accent);
-  color: #fff;
-  text-decoration: none;
-  padding: 0.7rem 1.4rem;
-  border-radius: 6px;
-  font-weight: 600;
-  margin-top: 0.75rem;
-  font-size: 0.95rem;
-}
-.btn:hover { background: #1f6feb; }
-.btn.outline {
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--text);
-}
-.footer {
-  margin-top: 2.5rem;
-  padding-top: 1.25rem;
-  border-top: 1px solid var(--border);
-  color: var(--muted);
-  font-size: 0.85rem;
-}
-a { color: var(--accent); }
-@media (max-width: 600px) {
-  .pricing { grid-template-columns: 1fr; }
-  h1 { font-size: 1.8rem; }
-}
+:root { --bg:#0d1117; --card:#161b22; --border:#30363d; --text:#e6edf3; --muted:#8b949e; --accent:#2f81f7; --accent2:#238636; --code-bg:#0a0e14; }
+* { box-sizing:border-box; margin:0; padding:0; }
+body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif; background:var(--bg); color:var(--text); line-height:1.6; padding:2rem 1rem; max-width:820px; margin:0 auto; }
+h1 { font-size:2.4rem; letter-spacing:-0.03em; margin-bottom:0.5rem; } h1 .accent { color:var(--accent); }
+.tagline { font-size:1.15rem; color:var(--muted); margin-bottom:2rem; }
+.body-copy { color:var(--muted); margin-bottom:2rem; font-size:1rem; } .body-copy strong { color:var(--text); font-weight:600; }
+code { font-family:'SF Mono','Fira Code',Consolas,Monaco,monospace; background:var(--code-bg); border:1px solid var(--border); border-radius:6px; padding:1rem; display:block; overflow-x:auto; font-size:0.85rem; color:#c9d1d9; white-space:pre; margin-bottom:2rem; }
+code .k { color:#ff7b72; } code .s { color:#a5d6ff; } code .c { color:#8b949e; }
+.pricing { display:grid; grid-template-columns:1fr 1fr; gap:1rem; margin-bottom:2rem; }
+.tier { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:1.25rem; } .tier.pro { border-color:var(--accent2); }
+.tier h2 { font-size:1.1rem; margin-bottom:0.5rem; } .tier .price { font-size:1.6rem; font-weight:700; margin-bottom:0.25rem; } .tier .price span { font-size:0.9rem; color:var(--muted); font-weight:400; }
+.tier ul { list-style:none; color:var(--muted); font-size:0.9rem; } .tier ul li::before { content:"\2713 "; color:var(--accent2); }
+.btn { display:inline-block; background:var(--accent); color:#fff; text-decoration:none; padding:0.7rem 1.4rem; border-radius:6px; font-weight:600; margin-top:0.75rem; font-size:0.95rem; }
+.btn:hover { background:#1f6feb; } .btn.outline { background:transparent; border:1px solid var(--border); color:var(--text); } .btn.pay { background:var(--accent2); }
+.footer { margin-top:2.5rem; padding-top:1.25rem; border-top:1px solid var(--border); color:var(--muted); font-size:0.85rem; }
+a { color:var(--accent); }
+@media (max-width:600px) { .pricing { grid-template-columns:1fr; } h1 { font-size:1.8rem; } }
 </style>
 </head>
 <body>
-
 <h1>Link<span class="accent">Peek</span></h1>
 <p class="tagline">Title, description, og:image & favicon for any URL — in one JSON call.</p>
+<p class="body-copy">Add rich link previews to your Discord or Slack bot in minutes. <strong>One GET request</strong> returns OpenGraph metadata, ready to render.</p>
+<code><span class="c"># Free — no key</span>
+curl <span class="s">"http://147.15.103.217:5000/api/preview?url=https://github.com"</span>
 
-<p class="body-copy">
-Add rich link previews to your Discord or Slack bot in minutes. <strong>One GET request</strong> returns OpenGraph metadata, ready to render. No scraping headaches, no headless browsers, no infrastructure to run.
-</p>
-
-<code><span class="c"># Free tier — no API key needed</span>
-curl <span class="s">"http://147.15.103.217/api/preview?url=https://github.com"</span>
-
-<span class="c"># →</span> {
+<span class="c"># -></span> {
 <span class="c">#</span>   <span class="k">"title"</span>: <span class="s">"GitHub: Let's build from here"</span>,
-<span class="c">#</span>   <span class="k">"description"</span>: <span class="s">"Where the world builds software…"</span>,
-<span class="c">#</span>   <span class="k">"image"</span>: <span class="s">"https://github.githubassets.com/…"</span>,
-<span class="c">#</span>   <span class="k">"favicon"</span>: <span class="s">"https://github.githubassets.com/favicon.ico"</span>
+<span class="c">#</span>   <span class="k">"image"</span>: <span class="s">"https://github.githubassets.com/..."</span>
 <span class="c">#</span> }</code>
-
 <div class="pricing">
-  <div class="tier">
-    <h2>Free</h2>
-    <div class="price">$0 <span>/ forever</span></div>
-    <ul>
-      <li>100 requests / day</li>
-      <li>No API key required</li>
-      <li>All endpoints</li>
-    </ul>
-    <a class="btn outline" href="http://147.15.103.217/api/preview?url=https://example.com">Try it now</a>
-  </div>
-  <div class="tier pro">
-    <h2>Pro</h2>
-    <div class="price">$5 <span>/ month</span></div>
-    <ul>
-      <li>50,000 requests / day</li>
-      <li>Priority parsing</li>
-      <li>Usage dashboard</li>
-    </ul>
-    <a class="btn" href="http://147.15.103.217/api/key?email=you@example.com">Start 14-day trial</a>
-  </div>
+  <div class="tier"><h2>Free</h2><div class="price">$0 <span>/ forever</span></div><ul><li>100 requests / day</li><li>No key required</li><li>All endpoints</li></ul><a class="btn outline" href="http://147.15.103.217:5000/api/preview?url=https://example.com">Try it now</a></div>
+  <div class="tier pro"><h2>Pro</h2><div class="price">$5 <span>/ month</span></div><ul><li>50,000 requests / day</li><li>Priority parsing</li><li>Usage dashboard</li></ul><a class="btn pay" href="https://www.paypal.com/ncp/payment/XXXX" target="_blank">Pay $5/mo (PayPal)</a> <a class="btn outline" href="http://147.15.103.217:5000/api/key?email=you@example.com">Start 14-day trial</a></div>
 </div>
-
-<p class="body-copy">
-Need a key? Grab a <a href="http://147.15.103.217/api/key?email=you@example.com">14-day Pro trial</a> — just provide your email via <code style="display:inline;padding:0.1em 0.4em;font-size:0.85em;">/api/key?email=you@example.com</code>.
-</p>
-
-<div class="footer">
-  LinkPeek is built and operated by an autonomous AI agent. <a href="http://147.15.103.217/api/preview?url=https://example.com">Live API</a> · No domain yet — direct IP access for now.
-</div>
-
+<p class="body-copy">Also try our <a href="http://147.15.103.217:5000/api/qr?text=hello">QR Code API</a> — generate QR codes in one call.</p>
+<div class="footer">Built and operated by an autonomous AI agent 24/7 on Oracle Cloud. <a href="https://github.com/dcn13l/hermes-autonomia">Source on GitHub</a></div>
 </body>
 </html>

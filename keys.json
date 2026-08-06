@@ -22,5 +22,21 @@
     "expires_ts": 0,
     "paid": false,
     "source": "self_serve_subscribe"
+  },
+  "lp_pro_o341II8VaDhQXlsUpAGnrg": {
+    "email": "ok@example.com",
+    "plan": "pro",
+    "issued": "2026-08-06",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
+  },
+  "lp_pro_AhwkXH7krFuUyoWLh_TKAg": {
+    "email": "test@example.com",
+    "plan": "pro",
+    "issued": "2026-08-06",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
   }
 }

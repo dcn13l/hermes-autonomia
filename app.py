@@ -12,6 +12,9 @@ Single Flask app. Endpoints:
                                    screenshot service URL the caller can hit
     GET  /api/qr               generate QR code PNG from ?text=
     GET  /api/key?email=…      issues a 14-day trial API key
+    GET  /api/favicons          proxies the favicon image bytes for a URL
+    GET  /api/robots            returns a site's robots.txt parsed as JSON
+    GET  /api/headers           returns only the HTTP response headers for a URL
     GET  /api/health           {ok, today:{day, count}}
 """
 
@@ -54,7 +57,7 @@ _BATCH_MAX = 5
 _BATCH_TIMEOUT = 12.0
 
 # Service metadata for /api/status
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 _START_TIME = time.time()
 
 
@@ -603,11 +606,204 @@ def api_validate_key():
     return jsonify(valid=True, key_status=info)
 
 
+# ============================================================================
+# Proxy-style utility endpoints (1.2.0): favicon image, robots.txt, headers
+# ============================================================================
+@app.route("/api/favicons")
+@rate_limit(app)
+def api_favicons():
+    """Fetch and proxy a site's favicon image bytes directly.
+
+    Resolves the favicon the same way /api/preview does (link rel=icon, then
+    /favicon.ico fallback) and streams the image back with the upstream
+    Content-Type, so a browser <img src="/api/favicons?url=…"> just works
+    without CORS tangles. ?size= controls body byte cap (default 512 KiB).
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    max_bytes = 512 * 1024
+    try:
+        max_bytes = max(1024, int(request.values.get("size") or max_bytes))
+    except ValueError:
+        pass
+    try:
+        preview = preview_link(url)
+    except (URLError, HTTPError, socket.timeout, ValueError, ssl.SSLError) as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+    favicon_url = preview.get("favicon") or ""
+    if not favicon_url or favicon_url.startswith("data:"):
+        return jsonify(url=url, error="no_favicon_found"), 404
+    opener = build_opener(ProxyHandler())
+    req = Request(
+        favicon_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; LinkPeek/1.0; +https://github.com/linkpeek)",
+            "Accept": "image/*,*/*;q=0.8",
+        },
+        method="GET",
+    )
+    try:
+        resp = opener.open(req, timeout=8.0)
+    except (URLError, HTTPError, socket.timeout, ssl.SSLError) as e:
+        return jsonify(url=favicon_url, error="favicon_fetch_failed: %s" % type(e).__name__), 502
+    body = resp.read(max_bytes + 1)
+    if len(body) > max_bytes:
+        return jsonify(url=favicon_url, error="favicon_too_large"), 413
+    ctype = (resp.headers.get("Content-Type") or "application/octet-stream").split(";")[0].strip()
+    record_billing(g.meter_key, g.plan, "favicon:%s" % (preview.get("url", "")[:150]))
+    return Response(body, mimetype=ctype, headers={"Cache-Control": "public, max-age=3600"})
+
+
+@app.route("/api/robots")
+@rate_limit(app)
+def api_robots():
+    """Fetch a site's /robots.txt and return it parsed as JSON.
+
+    Returns: status (200/404/etc), raw (the raw text), user_agents (a list of
+    {user_agent, allow:[], disallow:[], crawl_delay}) and sitemaps ([urls]).
+    Resolves the URL to its scheme://host/robots.txt, following redirects.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    parts = urlsplit(url)
+    robots_url = "{}://{}/robots.txt".format(parts.scheme, parts.netloc)
+    opener = build_opener(ProxyHandler())
+    req = Request(
+        robots_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; LinkPeek/1.0; +https://github.com/linkpeek)",
+            "Accept": "text/plain,*/*;q=0.8",
+        },
+        method="GET",
+    )
+    status = 200
+    raw = ""
+    try:
+        resp = opener.open(req, timeout=8.0)
+        raw = resp.read(_MAX_BYTES).decode("utf-8", errors="ignore")
+        status = resp.getcode() or 200
+    except HTTPError as e:
+        status = e.code
+        if status == 404:
+            raw = ""  # missing robots.txt means "allow everything"
+        else:
+            try:
+                raw = e.read(_MAX_BYTES).decode("utf-8", errors="ignore")
+            except (OSError, AttributeError):
+                pass
+    except (URLError, socket.timeout, ssl.SSLError) as e:
+        return jsonify(url=robots_url, error="fetch_failed: %s" % type(e).__name__), 502
+
+    # Parse robots.txt into structured JSON (RFC 9309, forgiving).
+    user_agents = []
+    sitemaps = []
+    current = None
+    for line in raw.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if ":" not in line:
+            continue
+        field, _, value = line.partition(":")
+        field = field.strip().lower()
+        value = value.strip()
+        if field == "user-agent":
+            if not current or current.get("user_agent") != value:
+                current = {"user_agent": value, "allow": [], "disallow": [], "crawl_delay": None}
+                user_agents.append(current)
+        elif field == "allow" and current is not None:
+            current["allow"].append(value)
+        elif field == "disallow" and current is not None:
+            if value == "":
+                continue  # "Disallow:" with empty value means "allow all"
+            current["disallow"].append(value)
+        elif field == "crawl-delay" and current is not None:
+            try:
+                current["crawl_delay"] = float(value)
+            except ValueError:
+                current["crawl_delay"] = None
+        elif field == "sitemap":
+            sitemaps.append(value)
+
+    out = {
+        "url": robots_url,
+        "status": status,
+        "raw": raw,
+        "user_agents": user_agents,
+        "sitemaps": sitemaps,
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "robots:%s" % parts.netloc[:150])
+    return jsonify(out)
+
+
+@app.route("/api/headers")
+@rate_limit(app)
+def api_headers():
+    """Return only the HTTP response headers for a URL — no body parsing.
+
+    Issues a GET but discards the body (reads at most 1 byte just to trigger
+    the response). Returns final_url (after redirects), status, and headers
+    as a flat dict. Cheap and fast for link-card builders that only need
+    Content-Type / charset / caching / canonical hints.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    opener = build_opener(ProxyHandler())
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; LinkPeek/1.0; +https://github.com/linkpeek)",
+            "Accept": "*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate",
+        },
+        method="GET",
+    )
+    status = 200
+    try:
+        resp = opener.open(req, timeout=8.0)
+        _ = resp.read(1)  # consume precisely nothing of the body
+        final_url = resp.geturl()
+        status = resp.getcode() or 200
+        headers = {k: v for k, v in resp.headers.items()}
+    except HTTPError as e:
+        final_url = e.url or url
+        status = e.code
+        try:
+            e.read(1)  # drain the tiny error body
+        except (OSError, AttributeError):
+            pass
+        headers = {k: v for k, v in (e.headers or {}).items()}
+    except (URLError, socket.timeout, ssl.SSLError) as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+    out = {
+        "url": final_url,
+        "status": status,
+        "headers": headers,
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "headers:%s" % url[:150])
+    return jsonify(out)
+
+
 @app.route("/api/status")
 def api_status():
-    """Self-describing service manifest: version, uptime, and the full list
-    of registered API routes with their methods. Useful for SDK clients and
-    for a landing-page client to render an endpoint catalogue dynamically."""
+    """Self-describing service manifest (1.2.0): version, uptime, and the
+    full list of registered API routes with their methods. Useful for SDK
+    clients and for a landing-page client to render an endpoint catalogue
+    dynamically. New in 1.2.0: /api/favicons (image proxy), /api/robots
+    (robots.txt as JSON), /api/headers (headers-only fetch)."""
     routes = sorted(
         (
             {

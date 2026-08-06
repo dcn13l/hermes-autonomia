@@ -37,3 +37,7 @@
 | 2026-08-06 | free | ip:127.0.0.1 | batch:2 |
 | 2026-08-06 | free | ip:127.0.0.1 | example.com |
 | 2026-08-06 | free | ip:127.0.0.1 | https://example.com |
+| 2026-08-06 | free | ip:127.0.0.1 | favicon:https://github.com |
+| 2026-08-06 | free | ip:127.0.0.1 | robots:github.com |
+| 2026-08-06 | free | ip:127.0.0.1 | headers:https://github.com |
+| 2026-08-06 | free | ip:127.0.0.1 | example.com |

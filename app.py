@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 import socket
 import ssl
 import gzip
@@ -40,6 +41,7 @@ from decorators import (
     daily_totals,
     record_billing,
     subscribe,
+    key_status,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -50,6 +52,10 @@ _MAX_BYTES = 2 * 1024 * 1024  # 2 MiB
 # Batch endpoint cap.
 _BATCH_MAX = 5
 _BATCH_TIMEOUT = 12.0
+
+# Service metadata for /api/status
+__version__ = "1.1.0"
+_START_TIME = time.time()
 
 
 # ============================================================================
@@ -456,18 +462,26 @@ def api_batch():
         except Exception as e:
             return {"url": u, "error": "fetch_failed: %s" % type(e).__name__}
 
-    results = []
+    results_by_url = {u: {"url": u, "error": "timeout: batch"} for u in urls}
     with ThreadPoolExecutor(max_workers=min(len(urls), 5)) as ex:
         future_map = {ex.submit(_one, u): u for u in urls}
-        for u in urls:
-            fut = next((f for f, v in future_map.items() if v == u), None)
-            if fut is None:
-                results.append({"url": u, "error": "internal_error"})
-            else:
+        try:
+            for fut in as_completed(future_map, timeout=_BATCH_TIMEOUT):
+                u = future_map[fut]
                 try:
-                    results.append(fut.result(timeout=_BATCH_TIMEOUT))
+                    results_by_url[u] = fut.result(timeout=_BATCH_TIMEOUT)
                 except Exception as e:
-                    results.append({"url": u, "error": "timeout: %s" % type(e).__name__})
+                    results_by_url[u] = {"url": u, "error": "timeout: %s" % type(e).__name__}
+        except TimeoutError:
+            # as_completed's own timeout fired: anything not yet delivered
+            # stays at the "timeout: batch" placeholder set above, and we
+            # cancel whatever futures are still running so the pool exits.
+            for fut, u in future_map.items():
+                if results_by_url[u].get("error", "").startswith("timeout"):
+                    fut.cancel()
+
+    # Preserve the original request order (matches deduped `urls`).
+    results = [results_by_url[u] for u in urls]
 
     record_billing(g.meter_key, g.plan, "batch:%d" % len(urls))
     out = {
@@ -497,6 +511,125 @@ def api_subscribe():
     except ValueError as ve:
         return jsonify(error=str(ve)), 400
     return jsonify(result)
+
+
+# ============================================================================
+# New endpoints: strict OpenGraph, URL diff, key validation, service status
+# ============================================================================
+def _og_only(preview: dict) -> dict:
+    """Reduce a preview_link() result to OpenGraph fields, camelCased,
+    matching what most embed/link-card consumers expect."""
+    src = preview or {}
+    return {
+        "url": src.get("url", ""),
+        "title": src.get("title", ""),
+        "description": src.get("description", ""),
+        "image": src.get("image", ""),
+        "siteName": src.get("site_name", ""),
+    }
+
+
+@app.route("/api/opengraph")
+@rate_limit(app)
+def api_opengraph():
+    """Strict OpenGraph view — only og:* derived fields, camelCased JSON."""
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        out = preview_link(url)
+    except (URLError, HTTPError, socket.timeout, ValueError, ssl.SSLError) as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+    out = _og_only(out)
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, url[:200])
+    return jsonify(out)
+
+
+@app.route("/api/diff")
+@rate_limit(app)
+def api_diff():
+    """Compare two URLs' link-preview metadata and report field-level diffs.
+
+    Query: ?url1=...&url2=...  (both required, fetched in parallel)."""
+    u1 = (request.values.get("url1") or "").strip()
+    u2 = (request.values.get("url2") or "").strip()
+    if not u1 or not u2:
+        return jsonify(error="pass ?url1=...&url2=..."), 400
+
+    def _one(u):
+        try:
+            return preview_link(u)
+        except Exception as e:
+            return {"url": u, "error": "fetch_failed: %s" % type(e).__name__}
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f1, f2 = ex.submit(_one, u1), ex.submit(_one, u2)
+        a, b = f1.result(timeout=_BATCH_TIMEOUT), f2.result(timeout=_BATCH_TIMEOUT)
+
+    if "error" in a or "error" in b:
+        return jsonify({"a": a, "b": b}), 502
+
+    fields = ["title", "description", "image", "site_name", "favicon", "url"]
+    diffs = []
+    for f in fields:
+        av, bv = a.get(f, ""), b.get(f, "")
+        if av != bv:
+            diffs.append({"field": f, "url1": av, "url2": bv})
+    out = {
+        "url1": u1,
+        "url2": u2,
+        "preview1": a,
+        "preview2": b,
+        "identical_fields": [f for f in fields if a.get(f, "") == b.get(f, "")],
+        "different_fields": diffs,
+        "diff_count": len(diffs),
+    }
+    record_billing(g.meter_key, g.plan, "diff")
+    out["quota"] = quota_echo(g)
+    return jsonify(out)
+
+
+@app.route("/api/validate-key")
+def api_validate_key():
+    """Check an API key's status: plan, validity, expiry, quota. Not metered
+    so users can check their key without burning quota."""
+    key = (request.values.get("key") or "").strip()
+    if not key:
+        return jsonify(error="pass ?key=..."), 400
+    info = key_status(key)
+    if info is None:
+        return jsonify(valid=False, error="invalid_or_expired_key"), 404
+    return jsonify(valid=True, key_status=info)
+
+
+@app.route("/api/status")
+def api_status():
+    """Self-describing service manifest: version, uptime, and the full list
+    of registered API routes with their methods. Useful for SDK clients and
+    for a landing-page client to render an endpoint catalogue dynamically."""
+    routes = sorted(
+        (
+            {
+                "path": r.rule,
+                "methods": sorted(m for m in r.methods if m in {"GET", "POST", "PUT", "DELETE"}),
+            }
+            for r in app.url_map.iter_rules()
+            if not r.rule.startswith("/static")
+        ),
+        key=lambda r: r["path"],
+    )
+    return jsonify(
+        ok=True,
+        service="LinkPeek",
+        version=__version__,
+        uptime_seconds=round(time.time() - _START_TIME, 1),
+        endpoints=routes,
+        free_daily_limit=100,
+        pro_daily_limit=50000,
+        docs="/api/status",
+        health="/api/health",
+    )
 
 
 @app.route("/api/health")

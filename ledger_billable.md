@@ -27,3 +27,13 @@
 | 2026-08-06 | free | ip:43.130.3.120 | https://github.com |
 | 2026-08-06 | free | ip:43.130.110.130 | https://example.com |
 | 2026-08-06 | free | ip:127.0.0.1 | https://github.com |
+| 2026-08-06 | free | ip:127.0.0.1 | https://example.com |
+| 2026-08-06 | free | ip:127.0.0.1 | https://github.com |
+| 2026-08-06 | free | ip:127.0.0.1 | example.com |
+| 2026-08-06 | free | ip:127.0.0.1 | example.com |
+| 2026-08-06 | free | ip:127.0.0.1 | diff |
+| 2026-08-06 | free | ip:127.0.0.1 | https://example.com |
+| 2026-08-06 | free | ip:127.0.0.1 | https://example.com |
+| 2026-08-06 | free | ip:127.0.0.1 | batch:2 |
+| 2026-08-06 | free | ip:127.0.0.1 | example.com |
+| 2026-08-06 | free | ip:127.0.0.1 | https://example.com |

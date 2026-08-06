@@ -206,6 +206,28 @@ def _key_info(apikey: str) -> dict | None:
     return info
 
 
+def key_status(apikey: str) -> dict | None:
+    """Public-facing key info for /api/validate-key. Returns plan, limits,
+    expiry, and used-today count, or None when the key is unknown/expired.
+    Does NOT echo the email back (PII guard)."""
+    info = _key_info(apikey)
+    if not info:
+        return None
+    plan = info.get("plan", "free")
+    limit = PRO_DAILY_LIMIT if plan in ("pro", "trial") else FREE_DAILY_LIMIT
+    used = used_today("key:" + apikey)
+    return {
+        "plan": plan,
+        "valid": True,
+        "issued": info.get("issued", ""),
+        "expires": info.get("expires", ""),
+        "expires_ts": info.get("expires_ts", 0),
+        "used_today": used,
+        "limit": limit,
+        "remaining": max(0, limit - used),
+    }
+
+
 def _client_ip(flask_request) -> str:
     """Best-effort client IP, honouring the first hop in X-Forwarded-For."""
     xff = flask_request.headers.get("X-Forwarded-For", "")

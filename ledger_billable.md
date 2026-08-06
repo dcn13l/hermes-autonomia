@@ -114,3 +114,15 @@
 | 2026-08-06 | free | ip:147.15.103.217 | https://github.com |
 | 2026-08-06 | free | ip:147.15.103.217 | https://github.com |
 | 2026-08-06 | free | ip:127.0.0.1 | og-image:https://github.com |
+| 2026-08-06 | free | ip:34.34.253.136 | https://github.com |
+| 2026-08-06 | free | ip:34.34.253.206 | https://example.com |
+| 2026-08-06 | free | ip:127.0.0.1 | structured-data:https://example.com |
+| 2026-08-06 | free | ip:127.0.0.1 | structured-data:https://github.com |
+| 2026-08-06 | free | ip:127.0.0.1 | structured-data:https://wordpress.org |
+| 2026-08-06 | free | ip:127.0.0.1 | structured-data:https://wordpress.org |
+| 2026-08-06 | free | ip:127.0.0.1 | structured-data:https://example.com |
+| 2026-08-06 | free | ip:127.0.0.1 | structured-data:https://example.com |
+| 2026-08-06 | free | ip:127.0.0.1 | structured-data:https://wordpress.org |
+| 2026-08-06 | free | ip:127.0.0.1 | structured-data:https://example.com |
+| 2026-08-06 | free | ip:127.0.0.1 | structured-data:https://wordpress.org |
+| 2026-08-06 | free | ip:127.0.0.1 | structured-data:https://wordpress.org |

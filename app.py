@@ -85,7 +85,7 @@ _FETCH_EXC = (
 )
 
 # Service metadata for /api/status
-__version__ = "1.7.1"
+__version__ = "1.8.0"
 _START_TIME = time.time()
 
 
@@ -2105,6 +2105,113 @@ def api_pdf_info():
     out.update(info)
     out["quota"] = quota_echo(g)
     record_billing(g.meter_key, g.plan, "pdf-info:%s" % final_url[:150])
+    return jsonify(out)
+
+
+# ============================================================================
+# Structured data extraction (1.8.0) — JSON-LD + microdata, stdlib only
+# ============================================================================
+# Parses <script type="application/ld+json"> blocks (JSON-LD) and microdata
+# itemtype/itemprop attributes from the full HTML document. Returns parsed
+# JSON-LD objects (list, since a page may carry several) plus a flat list of
+# microdata item scopes. No JavaScript execution; static HTML only.
+
+_JSONLD_RE = re.compile(
+    r'<script\b[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+    re.IGNORECASE | re.DOTALL,
+)
+_ITEMSCOPE_RE = re.compile(r'<[A-Za-z][^>]*\bitemscope\b[^>]*>', re.IGNORECASE)
+_ITEMTYPE_RE = re.compile(r'\bitemtype=["\']([^"\']+)["\']', re.IGNORECASE)
+_ITEMPROP_RE = re.compile(r'\bitemprop=["\']([^"\']+)["\']', re.IGNORECASE)
+
+
+def _extract_jsonld(html_text: str) -> list:
+    """Pull every JSON-LD block and json.loads() each; skip unparseable ones."""
+    out = []
+    for m in _JSONLD_RE.finditer(html_text):
+        raw = m.group(1).strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        # A single block may hold a top-level @graph or a bare object/list.
+        if isinstance(obj, dict) and "@graph" in obj and isinstance(obj["@graph"], list):
+            out.extend(obj["@graph"])
+        else:
+            out.append(obj)
+    return out
+
+
+def _extract_microdata(html_text: str) -> list:
+    """Collect itemtype URLs and itemprop names from microdata attributes."""
+    out = []
+    for m in _ITEMSCOPE_RE.finditer(html_text):
+        tag = m.group(0)
+        tm = _ITEMTYPE_RE.search(tag)
+        pm = _ITEMPROP_RE.findall(tag)
+        out.append({
+            "itemtype": tm.group(1) if tm else "",
+            "itemprops": pm,
+        })
+    # Also capture loose itemprops outside any itemscope (rare but valid).
+    loose = []
+    if not _ITEMSCOPE_RE.search(html_text):
+        loose = _ITEMPROP_RE.findall(html_text)
+    if loose and not out:
+        out.append({"itemtype": "", "itemprops": loose})
+    return out
+
+
+@app.route("/api/structured-data")
+@rate_limit(app)
+def api_structured_data():
+    """Extract JSON-LD and microdata structured data from a page.
+
+    Query: ?url=https://...  (required)
+
+    Returns:
+      * json_ld  — list of parsed JSON-LD objects (each @graph flattened in)
+      * microdata — list of {itemtype, itemprops[]} item scopes
+      * json_ld_count, microdata_count
+      * schema_types — flat list of @type values across all JSON-LD blocks
+    Pure stdlib: regex extraction + json. 502 on fetch failure.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        # Bad scheme / SSRF guard / missing netloc -> client-side 400, not 502.
+        # _FETCH_EXC includes ValueError, so without this catch the blanket
+        # fetch-failed except below would mask input validation as a 502.
+        return jsonify(error=str(e)), 400
+    try:
+        final_url, html_text, _ = _fetch(url)
+    except _FETCH_EXC as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+    json_ld = _extract_jsonld(html_text)
+    microdata = _extract_microdata(html_text)
+    schema_types = []
+    for obj in json_ld:
+        if isinstance(obj, dict):
+            t = obj.get("@type", "")
+            if isinstance(t, list):
+                schema_types.extend(str(x) for x in t)
+            elif t:
+                schema_types.append(str(t))
+    out = {
+        "url": final_url,
+        "json_ld": json_ld,
+        "json_ld_count": len(json_ld),
+        "microdata": microdata,
+        "microdata_count": len(microdata),
+        "schema_types": schema_types,
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "structured-data:%s" % final_url[:150])
     return jsonify(out)
 
 

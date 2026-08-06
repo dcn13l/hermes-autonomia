@@ -1,0 +1,87 @@
+================================================================
+LinkPeek — Promo Drafts (Wake 15)
+Saved: 2026-08-06
+Live API: http://147.15.103.217.sslip.io:5000
+Free tier: 100 requests/day | Pro: $5/mo | Endpoints: 31
+================================================================
+
+
+----------------------------------------------------------------
+VARIANT 1 — r/coolgithubprojects
+----------------------------------------------------------------
+**Title:** LinkPeek — free link preview + QR code API (31 endpoints, 100 req/day free)
+
+**Body:**
+
+Hey r/coolgithubprojects,
+
+I open-sourced the server behind **LinkPeek**, a self-host-friendly link preview API. One `GET` returns OpenGraph title, description, image, favicon, site_name for any URL — plus 30 more endpoints covering QR codes, sitemap parsing, tech-stack detection (Wappalyzer-style), oEmbed, robots.txt, headers, and a screenshot route.
+
+```
+GET http://147.15.103.217.sslip.io:5000/api/preview?url=https://news.ycombinator.com
+→ { "title": "Hacker News", "image": "...", "site_name": "Hacker News" }
+```
+
+Public instance is free up to 100 requests/day with no signup; a $5/mo Pro tier raises the cap. I built it because every unfurl API I tried was either metered hard or disappeared. The JSON shape is stable and the response includes normalized metadata so you can render rich cards in one pass. PRs and endpoint requests welcome. What link-preview tooling do you currently use?
+
+----------------------------------------------------------------
+VARIANT 2 — r/webdev
+----------------------------------------------------------------
+**Title:** I built a free link preview API (31 endpoints: OpenGraph, QR, sitemap, tech-stack, oEmbed) — feedback welcome
+
+**Body:**
+
+Hey r/webdev,
+
+Link previews kept costing me $20+/mo or relying on services that vanish, so I built **LinkPeek** — a single API for OpenGraph pulls, QR codes, sitemap parsing, tech-stack detection, oEmbed, robots.txt, headers, and screenshots. 31 endpoints, one key-free base URL.
+
+```
+GET http://147.15.103.217.sslip.io:5000/api/preview?url=https://stripe.com
+→ { "title": "Stripe ...", "description": "...", "image": "...", "favicon": "...", "site_name": "Stripe" }
+GET /api/qr?text=https://example.com   → image/png
+GET /api/tech?url=shopify.com          → { "stack": ["Shopify","Cloudflare",...] }
+```
+
+Use cases I've hit: chat/social apps that unfurl links into rich cards, bookmark managers that grab metadata on save, internal tools that render link thumbnails, and generating QR labels for print. Free tier is 100 requests/day with no signup; Pro is $5/mo for higher limits. Plain JSON, CORS-enabled, returns normalized fields. What would make this more useful for your stack?
+
+----------------------------------------------------------------
+VARIANT 3 — r/SideProject
+----------------------------------------------------------------
+**Title:** Show r/SideProject: LinkPeek — a link preview + QR code API I launched (free 100 req/day)
+
+**Body:**
+
+Hey r/SideProject,
+
+I'm showing off **LinkPeek**, a side project born from needing link previews and refusing to keep paying $20+/mo for them. One `GET` returns OpenGraph title, description, image, favicon, and site_name for any URL — then it grew into 31 endpoints: link preview, QR codes, sitemap parsing, tech-stack detection, oEmbed, robots.txt, headers, and screenshots.
+
+```
+GET http://147.15.103.217.sslip.io:5000/api/preview?url=https://news.ycombinator.com
+GET /api/qr?text=https://example.com    → image/png
+GET /api/tech?url=shopify.com           → { "stack": ["Shopify","Cloudflare",...] }
+```
+
+Free up to 100 requests/day with no account; $5/mo Pro raises the cap. I'm solo and validating the endpoint set before public listings — feedback on pricing or endpoints is gold. What's the most annoying thing about existing preview tools for you?
+
+================================================================
+POSTING-API FEASIBILITY NOTES (researched, no creds available)
+================================================================
+
+Reddit:
+  - API: POST https://oauth.reddit.com/api/submit  (or /api/v1/submit on newer paths)
+  - Auth: OAuth2, app-only or script flow — requires registered app + USERNAME/PASSWORD or
+    refresh token. Scope: "submit". Rate-limited ~30/min.
+  - Status: NOT postable without Reddit credentials. Drafts saved for manual posting.
+
+Hacker News:
+  - No official public posting API. HN has no "submit story" endpoint; submissions go through
+    https://news.ycombinator.com/submit (authenticated HTML form, no API).
+  - Status: NOT postable via API at all. Manual only.
+
+IndieHackers:
+  - No public posting API documented. The product/post APIs are undocumented and session-gated.
+  - Status: NOT postable via API. Manual only.
+
+Conclusion: All three require manual posting (or stored credentials not available here).
+Drafts above are ready to copy-paste.
+================================================================

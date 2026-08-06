@@ -48,6 +48,27 @@ curl <span class="s">"http://147.15.103.217.sslip.io/api/preview?url=https://git
 <div class="pricing">
   <div class="tier"><h2>Free</h2><div class="price">$0 <span>/ forever</span></div><ul><li>100 requests / day</li><li>No key required</li><li>All endpoints</li></ul><a class="btn outline" href="http://147.15.103.217.sslip.io/api/preview?url=https://example.com">Try it now</a></div>
   <div class="tier pro"><h2>Pro</h2><div class="price">$5 <span>/ month</span></div><ul><li>50,000 requests / day</li><li>Priority parsing</li><li>Usage dashboard</li><li>Non-expiring API key</li></ul>
+    <!-- ============================================================
+         PAYMENT SECTION (static placeholders — no secret keys)
+         TO ACTIVATE (human setup required):
+           1. Stripe Dashboard -> Payment Links -> Create -> $5/mo
+              subscription product -> copy the "pay" link, replace
+              the STRIPE_PAY_LINK_URL placeholder below.
+           2. Open paypal.com -> PayPal.me -> claim a handle, paste
+              it into PAYPAL_ME_HANDLE below.
+         Until then the buttons are disabled with a setup hint.
+    ============================================================ -->
+    <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:0.75rem">
+      <!-- Stripe Payment Link: opens a hosted checkout page, no key in front-end -->
+      <a id="pp-stripe" class="btn pay" target="_blank" rel="noopener"
+         href="#"
+         data-paylink="https://checkout.stripe.com/c/pay/REPLACE_WITH_PAYMENT_LINK_ID"
+         style="flex:1;min-width:150px;text-align:center;background:#635bff">Subscribe via Stripe</a>
+      <!-- PayPal.me: simple handle-based button -->
+      <a id="pp-paypal" class="btn" target="_blank" rel="noopener"
+         href="https://www.paypal.me/REPLACE_HANDLE/5"
+         style="flex:1;min-width:150px;text-align:center;background:#0070ba">Pay $5 via PayPal.me</a>
+    </div>
     <form id="pro-form" onsubmit="return linkpeekSubscribe(event)" style="margin-top:0.75rem">
       <input id="pro-email" type="email" placeholder="you@email.com" required style="width:100%;padding:0.55rem;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.9rem;margin-bottom:0.5rem">
       <button class="btn pay" type="submit" style="width:100%">Get Pro — $5/mo via PayPal</button>
@@ -123,6 +144,27 @@ function linkpeekSubscribe(e){
   }
   go.addEventListener('click', run);
   inp.addEventListener('keydown', function(e){ if (e.key === 'Enter'){ e.preventDefault(); run(); } });
+})();
+
+// ----------------------------------------------------------------
+// Payment placeholder guard: if the pay-link has not been replaced,
+// intercept clicks and show a setup hint instead of navigating to a dead URL.
+// Remove the `data-pending="1"` attribute on each <a> once real links are set.
+// ----------------------------------------------------------------
+(function(){
+  function stub(el, provider){
+    el.setAttribute('data-pending','1');
+    el.addEventListener('click', function(e){
+      e.preventDefault();
+      alert('Payment not connected yet. To enable ' + provider + ':\n' +
+        (provider === 'Stripe' ? 'Create a $5/mo subscription Payment Link in your Stripe Dashboard, then replace the href/data-paylink of #pp-stripe.' :
+         provider === 'PayPal' ? 'Claim your PayPal.me handle, then set #pp-paypal href to https://www.paypal.me/yourhandle/5.' : ''));
+    });
+  }
+  var s = document.getElementById('pp-stripe');
+  var p = document.getElementById('pp-paypal');
+  if (s && /REPLACE_WITH_PAYMENT_LINK_ID/.test(s.href + (s.dataset.paylink||''))) stub(s,'Stripe');
+  if (p && /REPLACE_HANDLE/.test(p.href)) stub(p,'PayPal');
 })();
 </script>
 </body>

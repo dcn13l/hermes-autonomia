@@ -444,11 +444,18 @@ try:
             if not re.match(r"^[0-9a-fA-F]{6}$", v):
                 return default
             return "#" + v.lower()
-        img = qr.make_image(fill_color=_hexcol("fg", "black"),
-                            back_color=_hexcol("bg", "white"))
-        buf = BytesIO()
-        img.save(buf, format="PNG")
-        buf.seek(0)
+        # make_image() lazily imports PIL; qrcode can be installed without
+        # Pillow, and that ImportError surfaces at request time (escapes the
+        # module-level try/except) turning the endpoint into a 500. Catch it
+        # here so the caller gets a structured 503 instead.
+        try:
+            img = qr.make_image(fill_color=_hexcol("fg", "black"),
+                                back_color=_hexcol("bg", "white"))
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            buf.seek(0)
+        except ImportError:
+            return jsonify(error="Pillow (PIL) not installed; cannot render PNG"), 503
         return Response(buf.getvalue(), mimetype="image/png")
 except ImportError:
     @app.route("/api/qr")
@@ -601,7 +608,8 @@ def api_key():
         key = issue_trial_key(email)
     except ValueError as ve:
         return jsonify(error=str(ve)), 400
-    return jsonify(key=key, trial_days=14, note="use ?key=<key> on /api/preview")
+    from decorators import TRIAL_DAYS
+    return jsonify(key=key, trial_days=TRIAL_DAYS, note="use ?key=<key> on /api/preview")
 
 
 @app.route("/api/subscribe")
@@ -759,9 +767,13 @@ def api_favicons():
     url = (request.values.get("url") or "").strip()
     if not url:
         return jsonify(error="pass ?url=https://..."), 400
+    # Cap the body byte limit: floor 1 KiB, default 512 KiB, ceiling 5 MiB
+    # so a caller can't turn this endpoint into a memory-exhaustion vector
+    # by passing ?size=9999999999.
+    _FAV_MAX = 5 * 1024 * 1024
     max_bytes = 512 * 1024
     try:
-        max_bytes = max(1024, int(request.values.get("size") or max_bytes))
+        max_bytes = max(1024, min(_FAV_MAX, int(request.values.get("size") or max_bytes)))
     except ValueError:
         pass
     try:
@@ -1616,21 +1628,17 @@ def _detect_tech(html_text: str, headers: dict) -> dict:
     # Limit scan to first 2 MiB (already capped by _fetch) and lowercased copy
     # for case-insensitive signature matching without re-lowering per regex.
     hay = html_text if len(html_text) <= _MAX_BYTES else html_text[:_MAX_BYTES]
+    # Every signature regex is compiled with re.IGNORECASE, so searching the
+    # lowercased haystack is sufficient and ~halves the work. The previous
+    # logic did a redundant second rx.search(hay) on every non-match and a
+    # dead fallback loop that could never add hits for re.I patterns.
     hay_l = hay.lower()
     detected = []
     for name, patterns in _TECH_SIGNATURES:
         hits = []
         for rx in patterns:
-            m = rx.search(hay if rx.flags & re.I and "version" in rx.pattern.lower() else hay_l) or rx.search(hay)
-            if m:
+            if rx.search(hay_l):
                 hits.append({"pattern": rx.pattern[:60]})
-        # For the generator-tag signatures we must scan original-case HTML
-        # because the content attr value can be ignored by .lower(); so we
-        # also fall back to the original-case haystack if nothing matched.
-        if not hits:
-            for rx in patterns:
-                if rx.search(hay):
-                    hits.append({"pattern": rx.pattern[:60]})
         if hits:
             detected.append({"name": name, "evidence": hits[:3]})
     # Generator meta tag (catch-all for CMSes we didn't pre-list).
@@ -1771,8 +1779,11 @@ def _parse_pdf_info(pdf_bytes: bytes) -> dict:
         pdf_version = mver.group(1).decode("ascii", "ignore")
     info = {k: "" for k in _PDF_INFO_KEYS}
     # Page count: count /Type /Page occurrences (favour /Type\s*/Page over
-    # /Pages to avoid double counting). Cheap and robust for most PDFs.
-    pages = len(re.findall(rb"/Type\s*/Page[^s/]", pdf_bytes))
+    # /Pages to avoid double counting). Use a trailing boundary ([^s/]|$)
+    # so a bare "/Type /Page" immediately before >> or EOF is still counted;
+    # the old [^s/] char-class required a trailing byte and under-counted
+    # pages whose /Page token sat at the very end of the trailer.
+    pages = len(re.findall(rb"/Type\s*/Page(?:[^s/]|$)", pdf_bytes))
     # Find the trailer /Info dict: /Info <ref> near %%EOF. We scan the last
     # 64 KiB which contains the trailer for the vast majority of PDFs.
     tail = pdf_bytes[-65536:] if len(pdf_bytes) > 65536 else pdf_bytes

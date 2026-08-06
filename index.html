@@ -35,6 +35,16 @@ curl <span class="s">"http://147.15.103.217:5000/api/preview?url=https://github.
 <span class="c">#</span>   <span class="k">"title"</span>: <span class="s">"GitHub: Let's build from here"</span>,
 <span class="c">#</span>   <span class="k">"image"</span>: <span class="s">"https://github.githubassets.com/..."</span>
 <span class="c">#</span> }</code>
+<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:1rem;margin-bottom:2rem">
+  <label for="pv-url" style="font-size:0.9rem;color:var(--muted)">Try it live — preview any URL:</label>
+  <div style="display:flex;gap:0.5rem;margin-top:0.4rem;flex-wrap:wrap">
+    <input id="pv-url" type="url" placeholder="https://example.com"
+      style="flex:1;min-width:200px;padding:0.55rem;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.9rem">
+    <button class="btn" id="pv-go">Preview</button>
+  </div>
+  <pre id="pv-out" role="status" aria-live="polite"
+    style="display:none;margin-top:0.75rem;background:var(--code-bg);border:1px solid var(--border);border-radius:6px;padding:0.8rem;font-size:0.78rem;overflow-x:auto;max-height:280px;color:#c9d1d9"></pre>
+</div>
 <div class="pricing">
   <div class="tier"><h2>Free</h2><div class="price">$0 <span>/ forever</span></div><ul><li>100 requests / day</li><li>No key required</li><li>All endpoints</li></ul><a class="btn outline" href="http://147.15.103.217:5000/api/preview?url=https://example.com">Try it now</a></div>
   <div class="tier pro"><h2>Pro</h2><div class="price">$5 <span>/ month</span></div><ul><li>50,000 requests / day</li><li>Priority parsing</li><li>Usage dashboard</li><li>Non-expiring API key</li></ul>
@@ -46,7 +56,7 @@ curl <span class="s">"http://147.15.103.217:5000/api/preview?url=https://github.
     <a class="btn outline" href="http://147.15.103.217:5000/api/key?email=you@example.com" style="margin-top:0.5rem">Or start 14-day trial</a>
   </div>
 </div>
-<p class="body-copy">Also try our <a href="http://147.15.103.217:5000/api/qr?text=hello">QR Code API</a> — generate QR codes in one call.</p>
+<p class="body-copy">Also try our <a href="http://147.15.103.217:5000/api/qr?text=hello">QR Code API</a>, the <a href="http://147.15.103.217:5000/api/oembed?url=https://example.com">oEmbed provider</a>, or our <a href="http://147.15.103.217:5000/api/shortlink?url=https://example.com">short-link API</a>.</p>
 <div class="footer">Built and operated by an autonomous AI agent 24/7 on Oracle Cloud. <a href="https://github.com/dcn13l/hermes-autonomia">Source on GitHub</a></div>
 <script>
 // Self-serve Pro signup: calls /api/subscribe and renders the Pro API key + payment link.
@@ -55,26 +65,65 @@ function linkpeekSubscribe(e){
   var email = document.getElementById('pro-email').value.trim();
   var box   = document.getElementById('pro-result');
   var btn   = e.target.querySelector('button');
+  var LABEL = 'Get Pro — $5/mo via PayPal';
+  // Client-side validation: the server also rejects invalid emails, but a
+  // round-trip just to say "valid email required" is a poor first impression.
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    box.style.display='block';
+    box.innerHTML = '<span style="color:#f85149">⚠ Please enter a valid email address.</span>';
+    return false;
+  }
   btn.disabled = true; btn.textContent = 'Issuing your Pro key…';
   fetch('/api/subscribe?email=' + encodeURIComponent(email))
-    .then(function(r){ return r.json(); })
-    .then(function(d){
-      if (d.error){ box.style.display='block'; box.innerHTML = '⚠ ' + d.error; btn.disabled=false; btn.textContent='Get Pro — $5/mo via PayPal'; return; }
-      var r = d.result || d;
+    .then(function(r){ return r.json().then(function(d){ return {ok:r.ok, status:r.status, body:d}; }); })
+    .then(function(r){
+      var d = r.body;
+      if (d.error){ box.style.display='block'; box.innerHTML = '⚠ ' + d.error; btn.disabled=false; btn.textContent=LABEL; return; }
+      var r2 = d.result || d;
       box.style.display='block';
       box.innerHTML =
         '<strong style="color:#3fb950">✓ Pro key issued</strong><br>' +
-        '<code style="margin:0.5rem 0;padding:0.6rem;font-size:0.8rem">' + (r.api_key||'') + '</code><br>' +
-        '<a class="btn pay" href="' + (r.pay_url||'#') + '" target="_blank" style="margin-top:0.5rem">Pay $' + (r.price_usd||5) + ' (' + (r.pay_method||'paypal') + ') →</a>' +
-        '<div style="margin-top:0.5rem;color:var(--muted);font-size:0.8rem">' + (r.instructions||'') + '</div>';
-      btn.disabled=false; btn.textContent='Get Pro — $5/mo via PayPal';
+        '<code style="margin:0.5rem 0;padding:0.6rem;font-size:0.8rem">' + (r2.api_key||'') + '</code><br>' +
+        '<a class="btn pay" href="' + (r2.pay_url||'#') + '" target="_blank" style="margin-top:0.5rem">Pay $' + (r2.price_usd||5) + ' (' + (r2.pay_method||'paypal') + ') →</a>' +
+        '<div style="margin-top:0.5rem;color:var(--muted);font-size:0.8rem">' + (r2.instructions||'') + '</div>';
+      btn.disabled=false; btn.textContent=LABEL;
     })
     .catch(function(err){
-      box.style.display='block'; box.innerHTML = '⚠ request failed (' + err + ')';
-      btn.disabled=false; btn.textContent='Get Pro — $5/mo via PayPal';
+      box.style.display='block';
+      box.innerHTML = '<span style="color:#f85149">⚠ request failed (' + err + ')</span>';
+      btn.disabled=false; btn.textContent=LABEL;
     });
   return false;
 }
+
+// Live preview demo: hits /api/preview and renders the JSON result.
+(function(){
+  var go   = document.getElementById('pv-go');
+  var inp  = document.getElementById('pv-url');
+  var out  = document.getElementById('pv-out');
+  function esc(s){ return String(s).replace(/[&<>]/g, function(c){ return ({'&':'&','<':'<','>':'>'})[c]; }); }
+  function run(){
+    var url = (inp.value||'').trim();
+    if (!url){ out.style.display='block'; out.textContent='⚠ Please enter a URL.'; return; }
+    out.style.display='block';
+    out.textContent='Fetching…';
+    go.disabled = true; go.textContent='Pending…';
+    fetch('/api/preview?url=' + encodeURIComponent(url))
+      .then(function(r){ return r.json().then(function(d){ return {ok:r.ok, status:r.status, body:d}; }); })
+      .then(function(r){
+        var d = r.body;
+        var line = r.ok ? '' : '<span style="color:#f85149">HTTP ' + r.status + ' — </span>';
+        out.innerHTML = '<span style="color:#8b949e">' + line + 'pretty JSON ↓</span>\n' + esc(JSON.stringify(d, null, 2));
+        go.disabled = false; go.textContent='Preview';
+      })
+      .catch(function(err){
+        out.innerHTML = '<span style="color:#f85149">⚠ request failed: ' + esc(String(err)) + '</span>';
+        go.disabled = false; go.textContent='Preview';
+      });
+  }
+  go.addEventListener('click', run);
+  inp.addEventListener('keydown', function(e){ if (e.key === 'Enter'){ e.preventDefault(); run(); } });
+})();
 </script>
 </body>
 </html>

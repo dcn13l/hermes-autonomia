@@ -16,6 +16,9 @@ Single Flask app. Endpoints:
     GET  /api/robots            returns a site's robots.txt parsed as JSON
     GET  /api/headers           returns only the HTTP response headers for a URL
     GET  /api/health           {ok, today:{day, count}}
+    GET  /api/oembed           oEmbed 1.0 "link" provider JSON for a URL
+    GET  /api/shortlink        create (?url=) or resolve (?code=) a base62 short link
+    GET  /lp/<code>            302-redirect for a short code
 """
 
 from __future__ import annotations
@@ -56,8 +59,23 @@ _MAX_BYTES = 2 * 1024 * 1024  # 2 MiB
 _BATCH_MAX = 5
 _BATCH_TIMEOUT = 12.0
 
+# Shared "fetch blew up" exception tuple: any of these means the upstream URL
+# refused/redirected-badly/timed out/cert-failed. We centralise it so every
+# view returns the same 502 fetch_failed shape and we don't miss a variant
+# (ConnectionResetError, builtin TimeoutError, etc.) on a copy-pasted handler.
+_FETCH_EXC = (
+    URLError,
+    HTTPError,
+    socket.timeout,
+    TimeoutError,            # builtin (Python 3.10+ may surface this directly)
+    ConnectionError,        # subclass of OSError: reset/refused/broken-pipe
+    OSError,                # catch-all for low-level I/O surprises
+    ValueError,             # _normalize_url rejections
+    ssl.SSLError,
+)
+
 # Service metadata for /api/status
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 _START_TIME = time.time()
 
 
@@ -227,15 +245,61 @@ def _clean(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-def _normalize_url(url: str) -> str:
+# Schemes we will *consider* fetching. Anything else is rejected before any
+# network call — this is the primary SSRF / local-file-disclosure guard.
+_ALLOWED_SCHEMES = {"http", "https"}
+# Conservative hostname blacklist for SSRF: loopback, link-local, RFC1918,
+# RFC4193 (ULA), and IPv6 loopback / ULA / link-local. Pro users can still
+# preview those if they really want to (we don't inspect the response body
+# for secret leakage — this is about blocking the *fetch*), but the default
+# posture for an open public API is to refuse to be an internal-network probe.
+_PRIVATE_HOST_RES = (
+    re.compile(r"^127\."),                       # 127.0.0.0/8
+    re.compile(r"^10\."),                        # 10.0.0.0/8
+    re.compile(r"^192\.168\."),                  # 192.168.0.0/16
+    re.compile(r"^172\.(1[6-9]|2[0-9]|3[01])\."),  # 172.16.0.0/12
+    re.compile(r"^169\.254\."),                  # 169.254.0.0/16 (link-local)
+    re.compile(r"^(0|255|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7]))\."),  # 0/8,255/8,endpoints
+    re.compile(r"^\[?$"),                         # bare-bracket edge
+)
+# IPv6: ::1 loopback, fc00::/7 ULA, fe80::/10 link-local. We only block
+# the well-known textual forms because full IPv6 parsing is heavy stdlib.
+_PRIVATE_V6 = ("::1", "fc", "fd", "fe80", "fe90", "fea0", "feb0", "fec0", "fed0", "fee0", "fef0")
+
+
+def _is_private_host(netloc: str) -> bool:
+    # Strip userinfo and port: "user:pass@host:port" -> "host"
+    if "@" in netloc:
+        netloc = netloc.rsplit("@", 1)[1]
+    # Strip bracketed IPv6 [::1]:port -> ::1
+    if netloc.startswith("["):
+        end = netloc.find("]")
+        host = netloc[1:end] if end != -1 else netloc
+        return any(host.startswith(p) for p in _PRIVATE_V6)
+    # Strip port (v4 or hostname)
+    host = netloc.rsplit(":", 1)[0] if netloc.count(":") == 1 else netloc
+    host = host.lower()
+    if host in ("localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"):
+        return True
+    for rx in _PRIVATE_HOST_RES:
+        if rx.match(host):
+            return True
+    return False
+
+
+def _normalize_url(url: str, allow_private: bool = False) -> str:
     if not url:
         raise ValueError("missing url")
     url = url.strip()
     if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", url):
         url = "https://" + url
     parts = urlsplit(url)
+    if parts.scheme.lower() not in _ALLOWED_SCHEMES:
+        raise ValueError("unsupported scheme: %s (only http/https)" % parts.scheme)
     if not parts.netloc:
         raise ValueError("invalid url")
+    if not allow_private and _is_private_host(parts.netloc):
+        raise ValueError("refusing to fetch non-public host")
     return url
 
 
@@ -343,10 +407,33 @@ try:
         text = (request.values.get("text") or "").strip()
         if not text:
             return jsonify(error="pass ?text=..."), 400
-        qr = qrcode.QRCode(version=1, box_size=10, border=2)
+        # QR capacity is ~2,953 bytes at the lowest error correction; cap at
+        # 2,000 to keep error-correction healthy and block oversized payloads
+        # from turning the endpoint into a memory/CPU chew toy.
+        _QR_MAX_CHARS = 2000
+        if len(text) > _QR_MAX_CHARS:
+            return jsonify(error="text_too_long", max=_QR_MAX_CHARS, got=len(text)), 413
+        # Optional ECC level via ?ecc=L|M|Q|H (default M).
+        _ECC = {"l": qrcode.constants.ERROR_CORRECT_L,
+                "m": qrcode.constants.ERROR_CORRECT_M,
+                "q": qrcode.constants.ERROR_CORRECT_Q,
+                "h": qrcode.constants.ERROR_CORRECT_H}
+        ecc = _ECC.get((request.values.get("ecc") or "m").strip().lower(),
+                       qrcode.constants.ERROR_CORRECT_M)
+        qr = qrcode.QRCode(version=None, error_correction=ecc,
+                           box_size=10, border=2)
         qr.add_data(text)
         qr.make(fit=True)
-        img = qr.make_image(fill_color="black", back_color="white")
+        # Allow caller to customise colours via ?fg= & ?bg= (hex, no #).
+        def _hexcol(name, default):
+            v = (request.values.get(name) or "").strip().lstrip("#")
+            if not v:
+                return default
+            if not re.match(r"^[0-9a-fA-F]{6}$", v):
+                return default
+            return "#" + v.lower()
+        img = qr.make_image(fill_color=_hexcol("fg", "black"),
+                            back_color=_hexcol("bg", "white"))
         buf = BytesIO()
         img.save(buf, format="PNG")
         buf.seek(0)
@@ -376,7 +463,7 @@ def api_preview():
         return jsonify(error="pass ?url=https://..."), 400
     try:
         out = preview_link(url)
-    except (URLError, HTTPError, socket.timeout, ValueError, ssl.SSLError) as e:
+    except _FETCH_EXC as e:
         return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
     out["quota"] = quota_echo(g)
     record_billing(g.meter_key, g.plan, url[:200])
@@ -392,7 +479,7 @@ def api_extract():
         return jsonify(error="pass ?url=https://..."), 400
     try:
         out = preview_link(url, collect_body=True)
-    except (URLError, HTTPError, socket.timeout, ValueError, ssl.SSLError) as e:
+    except _FETCH_EXC as e:
         return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
     out["quota"] = quota_echo(g)
     record_billing(g.meter_key, g.plan, url[:200])
@@ -409,7 +496,7 @@ def api_metadata_full():
     try:
         url = _normalize_url(url)
         final_url, html_text, headers = _fetch(url)
-    except (URLError, HTTPError, socket.timeout, ValueError, ssl.SSLError) as e:
+    except _FETCH_EXC as e:
         return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
     head_html = _extract_head(html_text)
     parser = _PeekParser(final_url)
@@ -541,7 +628,7 @@ def api_opengraph():
         return jsonify(error="pass ?url=https://..."), 400
     try:
         out = preview_link(url)
-    except (URLError, HTTPError, socket.timeout, ValueError, ssl.SSLError) as e:
+    except _FETCH_EXC as e:
         return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
     out = _og_only(out)
     out["quota"] = quota_echo(g)
@@ -568,7 +655,20 @@ def api_diff():
 
     with ThreadPoolExecutor(max_workers=2) as ex:
         f1, f2 = ex.submit(_one, u1), ex.submit(_one, u2)
-        a, b = f1.result(timeout=_BATCH_TIMEOUT), f2.result(timeout=_BATCH_TIMEOUT)
+        try:
+            a, b = f1.result(timeout=_BATCH_TIMEOUT), f2.result(timeout=_BATCH_TIMEOUT)
+        except TimeoutError:
+            # One or both previews didn't finish within the budget; report what
+            # we have so the caller gets a structured 504 instead of a 500.
+            def _res(fut, u):
+                if fut.done() and fut.exception() is None:
+                    try:
+                        return fut.result(timeout=0)
+                    except Exception:
+                        pass
+                return {"url": u, "error": "timeout: diff"}
+            return jsonify({"url1": u1, "url2": u2,
+                            "a": _res(f1, u1), "b": _res(f2, u2)}), 504
 
     if "error" in a or "error" in b:
         return jsonify({"a": a, "b": b}), 502
@@ -629,7 +729,7 @@ def api_favicons():
         pass
     try:
         preview = preview_link(url)
-    except (URLError, HTTPError, socket.timeout, ValueError, ssl.SSLError) as e:
+    except _FETCH_EXC as e:
         return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
     favicon_url = preview.get("favicon") or ""
     if not favicon_url or favicon_url.startswith("data:"):
@@ -645,7 +745,7 @@ def api_favicons():
     )
     try:
         resp = opener.open(req, timeout=8.0)
-    except (URLError, HTTPError, socket.timeout, ssl.SSLError) as e:
+    except (URLError, HTTPError, socket.timeout, ConnectionError, OSError, ssl.SSLError) as e:
         return jsonify(url=favicon_url, error="favicon_fetch_failed: %s" % type(e).__name__), 502
     body = resp.read(max_bytes + 1)
     if len(body) > max_bytes:
@@ -697,7 +797,7 @@ def api_robots():
                 raw = e.read(_MAX_BYTES).decode("utf-8", errors="ignore")
             except (OSError, AttributeError):
                 pass
-    except (URLError, socket.timeout, ssl.SSLError) as e:
+    except (URLError, socket.timeout, ConnectionError, OSError, ssl.SSLError) as e:
         return jsonify(url=robots_url, error="fetch_failed: %s" % type(e).__name__), 502
 
     # Parse robots.txt into structured JSON (RFC 9309, forgiving).
@@ -785,7 +885,7 @@ def api_headers():
         except (OSError, AttributeError):
             pass
         headers = {k: v for k, v in (e.headers or {}).items()}
-    except (URLError, socket.timeout, ssl.SSLError) as e:
+    except (URLError, socket.timeout, ConnectionError, OSError, ssl.SSLError) as e:
         return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
     out = {
         "url": final_url,
@@ -797,12 +897,154 @@ def api_headers():
     return jsonify(out)
 
 
+# ============================================================================
+# oEmbed provider endpoint (oembed.com spec) — link-card-friendly JSON
+# ============================================================================
+@app.route("/api/oembed")
+@rate_limit(app)
+def api_oembed():
+    """Minimal oEmbed provider response per oembed.com spec 1.0.
+
+    Query: ?url=https://...  (required)
+    Returns a "link" type oEmbed JSON document with title, author_name
+    (derived from og:site_name or hostname), provider_name, thumbnail_url
+    (the og:image / twitter:image), and the original url. Consumers like
+    Discord/Slack/iA Writer that speak oEmbed can use this directly.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        preview = preview_link(url)
+    except _FETCH_EXC as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+    parts = urlsplit(preview.get("url") or url)
+    provider = preview.get("site_name") or parts.hostname or ""
+    author = preview.get("site_name") or parts.hostname or ""
+    # oEmbed defines width/height as *positive integers*; we don't actually
+    # fetch the image to dimension it, so omit them (the spec permits omitting
+    # dimensions for "link" type — only "photo"/"video" require them).
+    out = {
+        "type": "link",
+        "version": "1.0",
+        "title": preview.get("title") or "",
+        "author_name": author,
+        "author_url": "%s://%s" % (parts.scheme, parts.netloc) if parts.scheme and parts.netloc else "",
+        "provider_name": provider,
+        "provider_url": "%s://%s" % (parts.scheme, parts.netloc) if parts.scheme and parts.netloc else "",
+        "cache_age": 3600,
+        "url": preview.get("url") or url,
+    }
+    if preview.get("image"):
+        out["thumbnail_url"] = preview["image"]
+    if preview.get("description"):
+        out["description"] = preview["description"]
+    record_billing(g.meter_key, g.plan, "oembed:%s" % url[:150])
+    out["quota"] = quota_echo(g)
+    return jsonify(out)
+
+
+# ============================================================================
+# Short-link endpoint — reversible base62 short codes, no DB required.
+# ============================================================================
+# In-process short-link store: {code: {url: ..., created: ts, hits: N}}.
+# Survives for the process lifetime only — appropriate for a v1 micro-service.
+# An operator wanting persistence swaps _SHORTLINKS for a DB-backed dict-like.
+_SHORTLINKS: dict[str, dict] = {}
+_BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+
+def _base62_encode(n: int) -> str:
+    if n == 0:
+        return _BASE62[0]
+    out = []
+    while n:
+        out.append(_BASE62[n % 62])
+        n //= 62
+    return "".join(reversed(out))
+
+
+@app.route("/api/shortlink")
+@rate_limit(app)
+def api_shortlink():
+    """Create or resolve a short link.
+
+    Two modes:
+      * Create:  ?url=https://...  ->  {code, short_url, original_url}
+      * Resolve: ?code=XXXX          ->  {code, original_url, hits}
+
+    Codes are base62 of an incrementing counter, prefixed 'lp/' so a single
+    LinkPeek host can serve them. Idempotent: the same input URL always
+    returns the same code (we scan the small in-memory map).
+    """
+    want_url = (request.values.get("url") or "").strip()
+    want_code = (request.values.get("code") or "").strip().upper()
+    if not want_url and not want_code:
+        return jsonify(error="pass ?url=... to create, or ?code=... to resolve"), 400
+
+    # Resolve mode.
+    if want_code:
+        rec = _SHORTLINKS.get(want_code)
+        if not rec:
+            return jsonify(error="not_found", code=want_code), 404
+        rec["hits"] = rec.get("hits", 0) + 1
+        record_billing(g.meter_key, g.plan, "shortlink:resolve")
+        return jsonify({
+            "code": want_code,
+            "original_url": rec["url"],
+            "hits": rec["hits"],
+            "created": rec["created"],
+            "quota": quota_echo(g),
+        })
+
+    # Create mode — validate the URL (scheme + non-private host + netloc).
+    try:
+        normalized = _normalize_url(want_url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+
+    # Idempotent: return existing code if we already shortened this URL.
+    for code, rec in _SHORTLINKS.items():
+        if rec.get("url") == normalized:
+            record_billing(g.meter_key, g.plan, "shortlink:reissue")
+            return jsonify({
+                "code": code,
+                "short_url": "/lp/%s" % code,
+                "original_url": normalized,
+                "already_existed": True,
+                "quota": quota_echo(g),
+            })
+
+    code = _base62_encode(len(_SHORTLINKS) + 1)
+    _SHORTLINKS[code] = {"url": normalized, "created": int(time.time()), "hits": 0}
+    record_billing(g.meter_key, g.plan, "shortlink:create")
+    return jsonify({
+        "code": code,
+        "short_url": "/lp/%s" % code,
+        "original_url": normalized,
+        "quota": quota_echo(g),
+    })
+
+
+@app.route("/lp/<code>")
+def lp_redirect(code):
+    """Resolve a short code and 302-redirect to the original URL."""
+    rec = _SHORTLINKS.get(code.upper())
+    if not rec:
+        return jsonify(error="not_found", code=code), 404
+    rec["hits"] = rec.get("hits", 0) + 1
+    from flask import redirect
+    return redirect(rec["url"], code=302)
+
+
 @app.route("/api/status")
 def api_status():
     """Self-describing service manifest (1.2.0): version, uptime, and the
     full list of registered API routes with their methods. Useful for SDK
     clients and for a landing-page client to render an endpoint catalogue
-    dynamically. New in 1.2.0: /api/favicons (image proxy), /api/robots
+    dynamically. New in 1.3.0: /api/oembed (oEmbed link provider),
+    /api/shortlink + /lp/<code> (base62 short links), SSRF guard in
+    _normalize_url. Earlier: /api/favicons (image proxy), /api/robots
     (robots.txt as JSON), /api/headers (headers-only fetch)."""
     routes = sorted(
         (

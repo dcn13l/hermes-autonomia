@@ -181,16 +181,75 @@ def subscribe(email: str, host: str = "") -> dict:
         "email": email,
         "api_key": api_key,
         "plan": "pro",
+        "status": "pending_activation",  # paid:false until operator reconciles payment
         "daily_limit": PRO_DAILY_LIMIT,
         "price_usd": PRO_PRICE_USD,
+        "billing_cycle": "month",
+        "currency": "USD",
         "pay_url": pay_url,
         "pay_method": pay_method,
-        "instructions": (
-            "1. Open pay_url and pay ${:.0f}.  2. Your Pro API key is already issued above. "
-            "3. Activation is manual — once we match your payment email to this key, "
-            "your daily quota jumps to {:,} requests/day. Until then your key gives you "
-            "the trial daily limit.".format(PRO_PRICE_USD, PRO_DAILY_LIMIT)
-        ),
+        "next_steps": [
+            "1. Open pay_url and pay ${:.0f}.".format(PRO_PRICE_USD),
+            "2. Your Pro API key is already issued above — keep it safe.",
+            "3. Activation is manual: once we match your payment email to this "
+            "key, your daily quota jumps to {:,} requests/day.".format(PRO_DAILY_LIMIT),
+            "4. Until activation, your key works at the trial daily limit.",
+        ],
+        "pricing": plan_catalog(),
+    }
+
+
+def plan_catalog() -> dict:
+    """Static price/feature catalogue for /api/pricing and to embed in
+    /api/subscribe responses.  Single source of truth for tier display."""
+    return {
+        "currency": "USD",
+        "plans": [
+            {
+                "id": "free",
+                "name": "Free",
+                "price_usd": 0.0,
+                "billing_cycle": "month",
+                "daily_limit": FREE_DAILY_LIMIT,
+                "auth": "none (metered per IP)",
+                "features": [
+                    "{} requests/day".format(FREE_DAILY_LIMIT),
+                    "No API key required",
+                    "All /api/* preview endpoints",
+                    "Community support",
+                ],
+            },
+            {
+                "id": "trial",
+                "name": "Trial",
+                "price_usd": 0.0,
+                "billing_cycle": "14 days",
+                "daily_limit": PRO_DAILY_LIMIT,
+                "auth": "API key (issued at /api/key?email=…)",
+                "features": [
+                    "{} requests/day for 14 days".format(PRO_DAILY_LIMIT),
+                    "Pro API key included",
+                    "No credit card required",
+                    "Auto-expires to Free afterwards",
+                ],
+            },
+            {
+                "id": "pro",
+                "name": "Pro",
+                "price_usd": PRO_PRICE_USD,
+                "billing_cycle": "month",
+                "daily_limit": PRO_DAILY_LIMIT,
+                "auth": "API key (issued at /api/subscribe?email=…)",
+                "features": [
+                    "{} requests/day".format(PRO_DAILY_LIMIT),
+                    "Non-expiring API key",
+                    "Priority email support",
+                    "All endpoints including /api/extract & /api/metadata-full",
+                ],
+            },
+        ],
+        "current_pro_price_usd": PRO_PRICE_USD,
+        "subscribe_url": "/api/subscribe?email=…",
     }
 
 

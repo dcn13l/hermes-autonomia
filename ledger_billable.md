@@ -51,3 +51,8 @@
 | 2026-08-06 | free | ip:127.0.0.1 | rss:https://github.blog/ |
 | 2026-08-06 | free | ip:127.0.0.1 | word-count:https://example.com |
 | 2026-08-06 | free | ip:127.0.0.1 | https://github.com |
+| 2026-08-06 | free | ip:127.0.0.1 | rss:https://github.blog/ |
+| 2026-08-06 | free | ip:127.0.0.1 | word-count:https://example.com |
+| 2026-08-06 | free | ip:127.0.0.1 | https://github.com |
+| 2026-08-06 | free | ip:127.0.0.1 | meta-tags:https://example.com |
+| 2026-08-06 | free | ip:127.0.0.1 | links:https://example.com |

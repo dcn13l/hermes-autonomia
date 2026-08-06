@@ -1,0 +1,321 @@
+openapi: 3.0.3
+info:
+  title: LinkPeek
+  version: "1.4.0"
+  description: |
+    Free link-preview + QR-code API. Unfurls any URL into OpenGraph
+    metadata (title, description, og:image, favicon) and generates QR
+    codes across 20 helper endpoints — oEmbed, RSS detection,
+    robots.txt, headers-only, batch fetch, diff, base62 short links,
+    word count & reading time, favicons proxy, screenshot hint,
+    status/health.
+
+    **Pricing:** free tier is 100 req/day with no key (metered per IP).
+    Optional Pro `?key=` lifts the quota to 50,000/day ($5/mo,
+    self-serve via `/api/subscribe`).
+  contact:
+    name: LinkPeek
+    url: https://github.com/dcn13l/hermes-autonomia
+    email: dcn13l@users.noreply.github.com
+  license:
+    name: MIT
+    url: https://github.com/dcn13l/hermes-autonomia/blob/main/LICENSE
+  x-color: "#2563eb"
+servers:
+  - url: http://147.15.103.217.sslip.io:5000
+    description: Public instance (HTTP; TLS pending on operator side)
+tags:
+  - name: preview
+    description: Link-preview & metadata extraction
+  - name: qr
+    description: QR code generation
+  - name: content
+    description: Page content analysis (word count, RSS, robots, headers)
+  - name: shortlink
+    description: Base62 short-link create / resolve
+  - name: billing
+    description: Key issuance, subscription, validation, status, health
+
+parameters:
+  ApiKey:
+    name: key
+    in: query
+    required: false
+    description: Pro/trial API key (lifts quota from 100/day to 50,000/day)
+    schema: { type: string, example: "lp_pro_aBcD..." }
+paths:
+  /api/preview:
+    get:
+      operationId: preview
+      tags: [preview]
+      summary: Link preview JSON (title, description, og:image, favicon)
+      parameters:
+        - $ref: '#/components/parameters/ApiKey'
+        - name: url
+          in: query
+          required: true
+          schema: { type: string, format: uri, example: "https://example.com" }
+      responses:
+        "200": { description: preview + quota echo, content: { application/json: { schema: { $ref: '#/components/schemas/Preview' } } } }
+        "400": { $ref: '#/components/responses/BadUrl' }
+        "429": { $ref: '#/components/responses/RateLimited' }
+        "502": { $ref: '#/components/responses/FetchFailed' }
+  /api/extract:
+    get:
+      operationId: extract
+      tags: [preview]
+      summary: Deeper crawl — raw meta + up to 50 headings + 100 links
+      parameters:
+        - $ref: '#/components/parameters/ApiKey'
+        - { name: url, in: query, required: true, schema: { type: string, format: uri } }
+      responses:
+        "200": { description: metadata + links + headings + quota, content: { application/json: { schema: { $ref: '#/components/schemas/Extract' } } } }
+        "502": { $ref: '#/components/responses/FetchFailed' }
+  /api/metadata-full:
+    get:
+      operationId: metadata_full
+      tags: [preview]
+      summary: Every meta tag in the document head + title + favicon
+      parameters:
+        - $ref: '#/components/parameters/ApiKey'
+        - { name: url, in: query, required: true, schema: { type: string, format: uri } }
+      responses:
+        "200": { description: full meta dump, content: { application/json: { schema: { type: object } } } }
+  /api/opengraph:
+    get:
+      operationId: opengraph
+      tags: [preview]
+      summary: OpenGraph-tag metadata only
+      parameters:
+        - $ref: '#/components/parameters/ApiKey'
+        - { name: url, in: query, required: true, schema: { type: string, format: uri } }
+      responses:
+        "200": { description: OpenGraph object, content: { application/json: { schema: { type: object } } } }
+  /api/batch:
+    get:
+      operationId: batch
+      tags: [preview]
+      summary: Up to 5 URLs at once (parallel fetch)
+      parameters:
+        - $ref: '#/components/parameters/ApiKey'
+        - { name: urls, in: query, required: true, schema: { type: string, description: "comma-separated URLs", example: "https://a.com,https://b.com" } }
+      responses:
+        "200": { description: per-URL results, content: { application/json: { schema: { type: object } } } }
+  /api/diff:
+    get:
+      operationId: diff
+      tags: [preview]
+      summary: Compare two URLs' metadata
+      parameters:
+        - $ref: '#/components/parameters/ApiKey'
+        - { name: url1, in: query, required: true, schema: { type: string, format: uri } }
+        - { name: url2, in: query, required: true, schema: { type: string, format: uri } }
+      responses:
+        "200": { description: structural diff, content: { application/json: { schema: { type: object } } } }
+  /api/word-count:
+    get:
+      operationId: word_count
+      tags: [content]
+      summary: Content stats — word count, reading time, top terms
+      parameters:
+        - $ref: '#/components/parameters/ApiKey'
+        - { name: url, in: query, required: true, schema: { type: string, format: uri } }
+        - { name: wpm, in: query, required: false, schema: { type: integer, minimum: 1, default: 200, example: 250 } }
+      responses:
+        "200": { description: content stats, content: { application/json: { schema: { type: object } } } }
+  /api/headers:
+    get:
+      operationId: headers
+      tags: [content]
+      summary: HTTP response headers only
+      parameters:
+        - $ref: '#/components/parameters/ApiKey'
+        - { name: url, in: query, required: true, schema: { type: string, format: uri } }
+      responses:
+        "200": { description: header dict, content: { application/json: { schema: { type: object, additionalProperties: { type: string } } } } }
+  /api/robots:
+    get:
+      operationId: robots
+      tags: [content]
+      summary: Parse a site's robots.txt as JSON
+      parameters:
+        - $ref: '#/components/parameters/ApiKey'
+        - { name: url, in: query, required: true, schema: { type: string, format: uri } }
+      responses:
+        "200": { description: parsed robots.txt, content: { application/json: { schema: { type: object } } } }
+  /api/rss:
+    get:
+      operationId: rss
+      tags: [content]
+      summary: Detect + parse RSS/Atom feed for a URL
+      parameters:
+        - $ref: '#/components/parameters/ApiKey'
+        - { name: url, in: query, required: true, schema: { type: string, format: uri } }
+      responses:
+        "200": { description: feed entries, content: { application/json: { schema: { type: object } } } }
+  /api/favicons:
+    get:
+      operationId: favicon
+      tags: [preview]
+      summary: Proxy favicon image bytes (image content-type)
+      parameters:
+        - $ref: '#/components/parameters/ApiKey'
+        - { name: url, in: query, required: true, schema: { type: string, format: uri } }
+      responses:
+        "200": { description: favicon bytes, content: { image/png: { schema: { type: string, format: binary } } } }
+        "502": { $ref: '#/components/responses/FetchFailed' }
+  /api/qr:
+    get:
+      operationId: qr
+      tags: [qr]
+      summary: Generate QR code PNG
+      parameters:
+        - $ref: '#/components/parameters/ApiKey'
+        - { name: text, in: query, required: true, schema: { type: string, maxLength: 2000, example: "https://example.com" } }
+        - { name: ecc, in: query, required: false, schema: { type: string, enum: [L, M, Q, H], default: M } }
+        - { name: box_size, in: query, required: false, schema: { type: integer, default: 10 } }
+        - { name: border, in: query, required: false, schema: { type: integer, default: 2 } }
+        - { name: fg, in: query, required: false, schema: { type: string, pattern: "^[0-9a-fA-F]{6}$", example: "000000" } }
+        - { name: bg, in: query, required: false, schema: { type: string, pattern: "^[0-9a-fA-F]{6}$", example: "ffffff" } }
+      responses:
+        "200": { description: QR PNG bytes, content: { image/png: { schema: { type: string, format: binary } } } }
+        "413": { description: text too long (>2000 chars), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/shortlink:
+    get:
+      operationId: shortlink
+      tags: [shortlink]
+      summary: Create (?url=) or resolve (?code=) a base62 short link
+      parameters:
+        - $ref: '#/components/parameters/ApiKey'
+        - { name: url,  in: query, required: false, schema: { type: string, format: uri } }
+        - { name: code, in: query, required: false, schema: { type: string, example: "ab12C" } }
+      responses:
+        "200": { description: code or resolved URL, content: { application/json: { schema: { $ref: '#/components/schemas/Shortlink' } } } }
+  /api/screenshot-url-hint:
+    get:
+      operationId: screenshot_url_hint
+      tags: [preview]
+      summary: Suggestion string for a hosted screenshot service URL
+      parameters:
+        - $ref: '#/components/parameters/ApiKey'
+        - { name: url, in: query, required: true, schema: { type: string, format: uri } }
+      responses:
+        "200": { description: hint, content: { application/json: { schema: { type: object } } } }
+
+  # --- billing / discovery (no key needed) ---
+  /api/key:
+    get:
+      operationId: trial_key
+      tags: [billing]
+      summary: Issue a 14-day trial API key
+      parameters:
+        - { name: email, in: query, required: true, schema: { type: string, format: email, example: "you@mail.com" } }
+      responses:
+        "200": { description: trial key, content: { application/json: { schema: { $ref: '#/components/schemas/TrialKey' } } } }
+  /api/subscribe:
+    get:
+      operationId: subscribe
+      tags: [billing]
+      summary: Pro key + self-serve payment link (revenue path)
+      parameters:
+        - { name: email, in: query, required: true, schema: { type: string, format: email } }
+      responses:
+        "200": { description: Pro key + pay_url, content: { application/json: { schema: { $ref: '#/components/schemas/Subscribe' } } } }
+  /api/validate-key:
+    get:
+      operationId: validate_key
+      tags: [billing]
+      summary: Validate an API key (shows plan + quota)
+      parameters:
+        - { name: key, in: query, required: true, schema: { type: string } }
+      responses:
+        "200": { description: key validity, content: { application/json: { schema: { type: object } } } }
+  /api/status:
+    get:
+      operationId: status
+      tags: [billing]
+      summary: Version + endpoint listing (discovery proxy, unmetered)
+      responses:
+        "200": { description: service metadata, content: { application/json: { schema: { $ref: '#/components/schemas/Status' } } } }
+  /api/health:
+    get:
+      operationId: health
+      tags: [billing]
+      summary: Liveness probe `{ok, today:{day, count}}` (unmetered)
+      responses:
+        "200": { description: health, content: { application/json: { schema: { type: object } } } }
+
+components:
+  parameters:
+    ApiKey:
+      name: key
+      in: query
+      required: false
+      description: Pro/trial API key (lifts quota from 100/day to 50,000/day)
+      schema: { type: string, example: "lp_pro_aBcD..." }
+  responses:
+    BadUrl:
+      description: missing or malformed url param
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    RateLimited:
+      description: per-IP free-tier quota exhausted
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    FetchFailed:
+      description: upstream fetch failed
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+  schemas:
+    Preview:
+      type: object
+      properties:
+        url:        { type: string }
+        title:      { type: string }
+        description: { type: string }
+        og:image:   { type: string, format: uri }
+        favicon:    { type: string, format: uri }
+        quota:      { $ref: '#/components/schemas/Quota' }
+    Extract:
+      type: object
+      properties:
+        url:      { type: string }
+        meta:     { type: object, additionalProperties: true }
+        headings: { type: array, items: { type: string } }
+        links:    { type: array, items: { type: string } }
+        quota:    { $ref: '#/components/schemas/Quota' }
+    TrialKey:
+      type: object
+      properties:
+        key:        { type: string }
+        trial_days: { type: integer, example: 14 }
+        note:       { type: string }
+    Subscribe:
+      type: object
+      properties:
+        api_key:      { type: string }
+        pay_url:      { type: string, format: uri }
+        pay_method:   { type: string, enum: [stripe, paypal, manual_email] }
+        price_usd:    { type: number, example: 5.0 }
+        instructions: { type: string }
+    Shortlink:
+      type: object
+      properties:
+        code: { type: string, example: "ab12C" }
+        url:  { type: string, format: uri }
+    Status:
+      type: object
+      properties:
+        version:   { type: string, example: "1.4.0" }
+        endpoints: { type: array, items: { type: string } }
+    Quota:
+      type: object
+      properties:
+        plan:       { type: string, enum: [free, trial, pro], example: free }
+        meter_key:  { type: string }
+        count:      { type: integer, example: 1 }
+        limit:      { type: integer, example: 100 }
+        remaining:  { type: integer, example: 99 }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:   { type: string, example: "rate_limit_exceeded" }
+        message: { type: string }

@@ -20,6 +20,8 @@ Single Flask app. Endpoints:
     GET  /api/shortlink        create (?url=) or resolve (?code=) a base62 short link
     GET  /api/word-count       content stats: word count, reading time, top terms
     GET  /api/rss              detect + parse RSS/Atom feed for a URL
+    GET  /api/links            extract all links, classified internal/external
+    GET  /api/meta-tags        flat key→value map of every head meta tag
     GET  /lp/<code>            302-redirect for a short code
 """
 
@@ -50,6 +52,7 @@ from decorators import (
     record_billing,
     subscribe,
     key_status,
+    plan_catalog,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -77,7 +80,7 @@ _FETCH_EXC = (
 )
 
 # Service metadata for /api/status
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 _START_TIME = time.time()
 
 
@@ -605,6 +608,18 @@ def api_subscribe():
     return jsonify(result)
 
 
+@app.route("/api/pricing")
+def api_pricing():
+    """Public plan catalogue: free vs trial vs pro pricing and limits.
+
+    Read-only, unauthenticated, no metering — meant for landing-page
+    pricing widgets and the /api/subscribe response to reference.  The
+    single source of truth is decorators.plan_catalog(); the env-overridable
+    limits (LINKPEEK_FREE_LIMIT/LINKPEEK_PRO_LIMIT/LINKPEEK_PRO_PRICE) flow
+    through automatically so the JSON never drifts from the meter."""
+    return jsonify(plan_catalog())
+
+
 # ============================================================================
 # New endpoints: strict OpenGraph, URL diff, key validation, service status
 # ============================================================================
@@ -655,13 +670,17 @@ def api_diff():
         except Exception as e:
             return {"url": u, "error": "fetch_failed: %s" % type(e).__name__}
 
+    import concurrent.futures
+    _FutTimeout = concurrent.futures.TimeoutError
     with ThreadPoolExecutor(max_workers=2) as ex:
         f1, f2 = ex.submit(_one, u1), ex.submit(_one, u2)
         try:
             a, b = f1.result(timeout=_BATCH_TIMEOUT), f2.result(timeout=_BATCH_TIMEOUT)
-        except TimeoutError:
-            # One or both previews didn't finish within the budget; report what
-            # we have so the caller gets a structured 504 instead of a 500.
+        except (TimeoutError, _FutTimeout):
+            # One or both previews didn't finish within the budget. We catch
+            # both the builtin TimeoutError (3.11+, where futures.Timeout
+            # is an alias) and the legacy 3.10 concrete subclass. Report
+            # what we have so the caller gets a structured 504 not a 500.
             def _res(fut, u):
                 if fut.done() and fut.exception() is None:
                     try:
@@ -875,7 +894,7 @@ def api_headers():
     status = 200
     try:
         resp = opener.open(req, timeout=8.0)
-        _ = resp.read(1)  # consume precisely nothing of the body
+        _ = resp.read(1)  # consume 1 byte to trigger the response headers
         final_url = resp.geturl()
         status = resp.getcode() or 200
         headers = {k: v for k, v in resp.headers.items()}
@@ -1383,16 +1402,116 @@ def api_word_count():
     return jsonify(out)
 
 
+# ============================================================================
+# Link extraction endpoint (1.5.0) — all outbound links, classified
+# ============================================================================
+@app.route("/api/links")
+@rate_limit(app)
+def api_links():
+    """Extract all links from a page, classified as internal/external.
+
+    Query: ?url=https://...  (required)
+    Optional: ?limit=50  (cap on links returned, default 200, max 500)
+
+    Returns links with href, text, and whether they are internal (same host
+    as the fetched URL) or external. Useful for SEO audits, broken-link
+    checkers, and crawler seed generation.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        limit_clamped = max(1, min(500, int(request.values.get("limit") or 200)))
+    except ValueError:
+        limit_clamped = 200
+    try:
+        out = preview_link(url, collect_body=True)
+    except _FETCH_EXC as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+
+    final_url = out.get("url", url)
+    base_host = (urlsplit(final_url).hostname or "").lower()
+    all_links = out.get("links", [])
+    internal = []
+    external = []
+    seen = set()
+    for link in all_links[:limit_clamped]:
+        href = link.get("href", "")
+        if not href or href.startswith("#") or href.startswith("javascript:"):
+            continue
+        if href in seen:
+            continue
+        seen.add(href)
+        host = (urlsplit(href).hostname or "").lower()
+        entry = {"href": href, "text": link.get("text", "")}
+        if not host or host == base_host:
+            internal.append(entry)
+        else:
+            external.append(entry)
+    result = {
+        "url": final_url,
+        "internal_links": internal,
+        "external_links": external,
+        "internal_count": len(internal),
+        "external_count": len(external),
+        "total_count": len(internal) + len(external),
+    }
+    result["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "links:%s" % final_url[:150])
+    return jsonify(result)
+
+
+# ============================================================================
+# Flat meta-tag listing (1.5.0) — every meta tag as key→value pairs
+# ============================================================================
+@app.route("/api/meta-tags")
+@rate_limit(app)
+def api_meta_tags():
+    """Return every <meta> tag from the page head as a flat key→value dict.
+
+    Query: ?url=https://...  (required)
+
+    Unlike /api/metadata-full (which returns a nested dict and response
+    headers), this endpoint gives a simple {property_or_name: content} map
+    suitable for quick inspection or CMS import. Both 'property' (OG/Twitter)
+    and 'name' attributes are included; if both are absent, http-equiv is
+    used as the key. Duplicate keys keep the first occurrence.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+        final_url, html_text, _ = _fetch(url)
+    except _FETCH_EXC as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+    head_html = _extract_head(html_text)
+    parser = _PeekParser(final_url)
+    try:
+        parser.feed(head_html)
+    except AssertionError:
+        pass
+    out = {
+        "url": final_url,
+        "title": _clean(parser.title),
+        "meta_tags": parser.meta,
+        "meta_count": len(parser.meta),
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "meta-tags:%s" % final_url[:150])
+    return jsonify(out)
+
+
 @app.route("/api/status")
 def api_status():
     """Self-describing service manifest (1.2.0): version, uptime, and the
     full list of registered API routes with their methods. Useful for SDK
     clients and for a landing-page client to render an endpoint catalogue
-    dynamically. New in 1.4.0: /api/rss (RSS/Atom feed detection + parse),
-    /api/word-count (content statistics). 1.3.0: /api/oembed (oEmbed link
-    provider), /api/shortlink + /lp/<code> (base62 short links), SSRF guard
-    in _normalize_url. Earlier: /api/favicons (image proxy), /api/robots
-    (robots.txt as JSON), /api/headers (headers-only fetch)."""
+    dynamically. New in 1.5.0: /api/links (link extraction, classified
+    internal/external), /api/meta-tags (flat meta key→value map).
+    New in 1.4.0: /api/rss, /api/word-count. 1.3.0: /api/oembed,
+    /api/shortlink + /lp/<code>, SSRF guard in _normalize_url.
+    Earlier: /api/favicons, /api/robots, /api/headers."""
     routes = sorted(
         (
             {

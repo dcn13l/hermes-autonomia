@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "linkpeek-api"
+version = "0.1.0"
+description = "Thin Python client for the LinkPeek link-preview + QR-code API."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "LinkPeek", email = "dcn13l@users.noreply.github.com" }]
+keywords = [
+  "link-preview",
+  "opengraph",
+  "oembed",
+  "qr-code",
+  "metadata",
+  "linkpeek",
+  "unfurl",
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Internet :: WWW/HTTP",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+]
+dependencies = [
+  # `requests` is the only hard dep for the public sync client. The async
+  # client prefers httpx if installed but degrades cleanly — httpx is
+  # imported lazily inside LinkPeekAsync so `pip install linkpeek-api`
+  # alone works without dragging in an extra lib.
+  "requests>=2.25,<3",
+]
+
+[project.optional-dependencies]
+async = ["httpx>=0.24,<1"]
+test = ["pytest>=7", "responses>=0.23"]
+
+[project.urls]
+Homepage = "https://github.com/dcn13l/hermes-autonomia"
+Source = "https://github.com/dcn13l/hermes-autonomia"
+Tracker = "https://github.com/dcn13l/hermes-autonomia/issues"
+API_Docs = "http://147.15.103.217.sslip.io:5000/api/status"
+
+[tool.setuptools]
+# Single-module package; shipped from this dir (no src/).
+py-modules = ["linkpeek"]

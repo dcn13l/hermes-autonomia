@@ -1,0 +1,36 @@
+{
+  "name": "linkpeek-api",
+  "version": "1.0.0",
+  "description": "Minimal Node.js SDK for the LinkPeek link-preview API — preview, extract, batch, QR, RSS, and more.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "test": "node -e \"require('./index.js'); console.log('ok')\""
+  },
+  "keywords": [
+    "linkpeek",
+    "link-preview",
+    "open-graph",
+    "oembed",
+    "qr-code",
+    "rss",
+    "web-scraper",
+    "metadata",
+    "api"
+  ],
+  "author": "LinkPeek",
+  "license": "MIT",
+  "homepage": "https://147.15.103.217.sslip.io:5000",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/linkpeek/linkpeek-api-node"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=14"
+  }
+}

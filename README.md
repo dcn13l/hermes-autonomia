@@ -88,6 +88,63 @@ and is sent straight to a hosted payment page. No listing review, no marketplace
 cut, no per-transaction discovery lag. RapidAPI remains a worthwhile *secondary*
 distribution channel once we have a production-ready spec.
 
+## Quickstart (curl / Python / Node.js)
+
+Base URL: `http://147.15.103.217.sslip.io:5000` · free tier = no key.
+
+### curl
+
+```bash
+# Link preview (JSON)
+curl "http://147.15.103.217.sslip.io:5000/api/preview?url=https://news.ycombinator.com"
+
+# QR code (PNG bytes — pipe to a file)
+curl "http://147.15.103.217.sslip.io:5000/api/qr?text=https://example.com" -o qr.png
+
+# Discovery (unmetered — version + every endpoint)
+curl "http://147.15.103.217.sslip.io:5000/api/status"
+
+# Pro: attach ?key= to lift the daily quota to 50,000
+curl "http://147.15.103.217.sslip.io:5000/api/preview?url=https://x.com&key=lp_pro_..."
+```
+
+### Python (`pip install linkpeek-api`)
+
+```python
+from linkpeek import LinkPeek
+
+lp = LinkPeek()                              # free tier, no key
+meta = lp.preview("https://news.ycombinator.com")
+print(meta["title"], meta.get("og:image"))
+
+png = lp.qr("https://example.com", ecc="H")  # -> bytes
+open("qr.png", "wb").write(png)
+
+# Go Pro (self-serve — key works immediately, pay_url is your Stripe/PayPal link):
+sub = LinkPeek().subscribe("you@mail.com")
+#  -> {"api_key": "lp_pro_...", "pay_url": "...", "price_usd": 5, ...}
+```
+
+SDK source: [`pypi-sdk/`](pypi-sdk/) · async client included (`linkpeek-api[async]`).
+
+### Node.js (zero deps, Node 18+ global `fetch`)
+
+```js
+const BASE = "http://147.15.103.217.sslip.io:5000";
+
+async function preview(url, apiKey) {
+  const qs = new URLSearchParams({ url, ...(apiKey ? { key: apiKey } : {}) });
+  const r = await fetch(`${BASE}/api/preview?${qs}`);
+  if (!r.ok) throw new Error(`LinkPeek ${r.status}: ${await r.text()}`);
+  return r.json();  // { title, description, og:image, favicon, quota }
+}
+
+const meta = await preview("https://news.ycombinator.com");
+console.log(meta.title, meta["og:image"]);
+```
+
+Full mini-client class + QR/shortlink helpers: [`pypi-sdk/examples/node_quickstart.md`](pypi-sdk/examples/node_quickstart.md).
+
 ## Ops
 - systemd unit: `/etc/systemd/system/linkpeek.service`
 - nginx (public port 80) proxies → `127.0.0.1:5000` (the systemd app)

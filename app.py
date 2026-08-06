@@ -18,6 +18,8 @@ Single Flask app. Endpoints:
     GET  /api/health           {ok, today:{day, count}}
     GET  /api/oembed           oEmbed 1.0 "link" provider JSON for a URL
     GET  /api/shortlink        create (?url=) or resolve (?code=) a base62 short link
+    GET  /api/word-count       content stats: word count, reading time, top terms
+    GET  /api/rss              detect + parse RSS/Atom feed for a URL
     GET  /lp/<code>            302-redirect for a short code
 """
 
@@ -75,7 +77,7 @@ _FETCH_EXC = (
 )
 
 # Service metadata for /api/status
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 _START_TIME = time.time()
 
 
@@ -1037,14 +1039,359 @@ def lp_redirect(code):
     return redirect(rec["url"], code=302)
 
 
+# ============================================================================
+# RSS / Atom feed detection + parsing (1.4.0) — stdlib xml.etree only
+# ============================================================================
+# Tiny RSS/Atom parser built on xml.etree.ElementTree. No dep on feedparser.
+# Handles the common cases: <rss>/<channel><item> and <feed><entry> (Atom).
+# Resolves relative URLs in <link> against the feed's own URL.
+
+try:
+    from xml.etree import ElementTree as _ET
+    _XML_AVAILABLE = True
+except ImportError:
+    _XML_AVAILABLE = False
+
+
+def _strip_ns(tag: str) -> str:
+    """Return the local name of a possibly-namespaced tag: '{ns}foo' -> 'foo'."""
+    if tag and tag[0] == "{":
+        return tag.split("}", 1)[1]
+    return tag
+
+
+def _parse_feed(xml_text: str, base_url: str = "") -> dict:
+    """Parse RSS 2.0 / Atom XML text into a dict of feed + items.
+
+    Returns {title, link, description, type, items: [{title, link,
+    description, pub_date}]} on success, or raises ValueError.
+    """
+    if not _XML_AVAILABLE:
+        raise ValueError("xml.etree unavailable")
+    if not xml_text or not xml_text.strip():
+        raise ValueError("empty feed body")
+    try:
+        root = _ET.fromstring(xml_text)
+    except _ET.ParseError as e:
+        raise ValueError("xml_parse_error: %s" % str(e))
+
+    root_local = _strip_ns(root.tag).lower()
+    is_atom = root_local == "feed"
+    is_rss = root_local == "rss"
+
+    if not is_atom and not is_rss:
+        raise ValueError("not a recognized feed root (<rss> or <feed>): got <%s>" % root_local)
+
+    def _text(elem, *names):
+        for n in names:
+            child = elem.find(n)
+            if child is not None and child.text:
+                return child.text.strip()
+        return ""
+
+    feed_info = {}
+    items = []
+
+    if is_rss:
+        # RSS: root -> <channel> -> meta + <item>*
+        channel = root.find("channel")
+        if channel is None:
+            raise ValueError("rss: missing <channel>")
+        feed_info["title"] = _text(channel, "title")
+        link = _text(channel, "link")
+        feed_info["link"] = urljoin(base_url, link) if link else ""
+        feed_info["description"] = _text(channel, "description")
+        feed_info["type"] = "rss"
+        for item in channel.findall("item"):
+            it_link = _text(item, "link")
+            it_link = urljoin(base_url, it_link) if it_link else ""
+            items.append({
+                "title": _text(item, "title"),
+                "link": it_link,
+                "description": _text(item, "description"),
+                "pub_date": _text(item, "pubDate", "pubdate", "date"),
+            })
+    else:
+        # Atom: root is <feed>, children are meta + <entry>*
+        feed_info["title"] = _text(root, "title")
+        # Atom <link> can have rel/type attributes; prefer rel="alternate"
+        link_val = ""
+        for link_elem in root.findall("link"):
+            rel = (link_elem.get("rel") or "alternate").lower()
+            href = link_elem.get("href") or ""
+            if rel == "alternate" and href:
+                link_val = href
+                break
+        if not link_val:
+            link_val = _text(root, "link")
+        feed_info["link"] = urljoin(base_url, link_val) if link_val else ""
+        feed_info["description"] = _text(root, "subtitle", "tagline")
+        feed_info["type"] = "atom"
+        for entry in root.findall("entry"):
+            it_link = ""
+            for link_elem in entry.findall("link"):
+                rel = (link_elem.get("rel") or "alternate").lower()
+                href = link_elem.get("href") or ""
+                if rel == "alternate" and href:
+                    it_link = href
+                    break
+            if not it_link:
+                it_link = _text(entry, "link")
+            it_link = urljoin(base_url, it_link) if it_link else ""
+            items.append({
+                "title": _text(entry, "title"),
+                "link": it_link,
+                "description": _text(entry, "summary", "content"),
+                "pub_date": _text(entry, "published", "updated", "published", "modified"),
+            })
+
+    feed_info["item_count"] = len(items)
+    feed_info["items"] = items[:20]  # cap to keep payload bounded
+    return feed_info
+
+
+def _detect_and_fetch_feed(page_url: str, html_text: str, headers: dict) -> dict | None:
+    """Given a page and its headers, find an RSS/Atom feed link.
+
+    Strategy (in order):
+      1. If the URL itself *is* a feed (Content-Type: application/rss+xml /
+         application/atom+xml / text/xml, or body parses as <rss>/<feed>),
+         return the parsed feed directly.
+      2. Scan <link rel="alternate" type="application/rss+xml" ...> and
+         type="application/atom+xml" in the HTML head.
+      3. Try common autodiscovery paths: /feed, /rss, /atom.xml, /feed.xml,
+         /rss.xml, /feed/index.xml on the same host.
+
+    Returns the parsed feed dict, or None if no feed was found.
+    """
+    base_url = page_url
+    ctype = (headers.get("Content-Type") or "").lower()
+    looks_like_feed = (
+        "rss+xml" in ctype or "atom+xml" in ctype
+        or "xml" in ctype
+    )
+    if looks_like_feed:
+        try:
+            return _parse_feed(html_text, base_url=base_url)
+        except ValueError:
+            pass  # fall through to link discovery
+
+    # 2. <link rel="alternate" type="application/...">
+    link_re = re.compile(
+        r"<link\b[^>]*\brel=[\"']?alternate[\"']?[^>]*>",
+        re.IGNORECASE,
+    )
+    type_re = re.compile(r"\btype=[\"']?(application/(?:rss|atom)\+xml)[\"']?", re.IGNORECASE)
+    href_re = re.compile(r"\bhref=[\"']([^\"']+)[\"']", re.IGNORECASE)
+    head = _extract_head(html_text)
+    for m in link_re.finditer(head):
+        tag = m.group(0)
+        if not type_re.search(tag):
+            continue
+        hm = href_re.search(tag)
+        if hm:
+            feed_url = urljoin(base_url, hm.group(1))
+            try:
+                furl, fhtml, fheaders = _fetch(feed_url)
+                if furl is not None:
+                    return _parse_feed(fhtml, base_url=furl)
+            except _FETCH_EXC:
+                continue
+            break
+
+    # 3. Common autodiscovery paths.
+    parts = urlsplit(base_url)
+    if parts.scheme and parts.netloc:
+        for path in ("/feed", "/rss", "/atom.xml", "/feed.xml", "/rss.xml", "/feed/index.xml"):
+            candidate = "{}://{}{}".format(parts.scheme, parts.netloc, path)
+            try:
+                c_url, c_html, _ = _fetch(candidate, timeout=5.0)
+            except _FETCH_EXC:
+                continue
+            try:
+                return _parse_feed(c_html, base_url=c_url)
+            except ValueError:
+                continue
+    return None
+
+
+@app.route("/api/rss")
+@rate_limit(app)
+def api_rss():
+    """Detect and parse an RSS or Atom feed for a URL.
+
+    Pass any page URL; the endpoint autodiscovers the feed via:
+      * Content-Type sniffing (if the URL *is* a feed),
+      * <link rel="alternate" type="application/rss+xml"> in the HTML head,
+      * common feed paths (/feed, /rss.xml, /atom.xml, /feed.xml).
+
+    Returns the feed title/link/description plus up to 20 items
+    (each with title, link, description, pub_date). 404 if no feed found.
+    """
+    if not _XML_AVAILABLE:
+        return jsonify(error="xml.etree unavailable on this server"), 503
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+        final_url, html_text, headers = _fetch(url)
+    except _FETCH_EXC as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+    try:
+        feed = _detect_and_fetch_feed(final_url, html_text, headers)
+    except _FETCH_EXC as e:
+        return jsonify(url=url, error="feed_fetch_failed: %s" % type(e).__name__), 502
+    if feed is None:
+        return jsonify(url=final_url, error="no_feed_found"), 404
+    feed["source_url"] = final_url
+    feed["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "rss:%s" % final_url[:150])
+    return jsonify(feed)
+
+
+# ============================================================================
+# Word count / content stats (1.4.0) — lightweight text analysis, stdlib only
+# ============================================================================
+# Reuses _PeekParser to strip tags, then reports word/char/read-time stats.
+
+class _TextExtractor(HTMLParser):
+    """Collect visible text from HTML, skipping <script> and <style>."""
+
+    _SKIP = {"script", "style", "noscript", "template", "svg", "head"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() in self._SKIP:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag):
+        if tag.lower() in self._SKIP and self._skip_depth > 0:
+            self._skip_depth -= 1
+
+    def handle_data(self, data):
+        if self._skip_depth == 0:
+            self.parts.append(data)
+
+    def text(self) -> str:
+        return " ".join(self.parts)
+
+
+@app.route("/api/word-count")
+@rate_limit(app)
+def api_word_count():
+    """Content statistics for a URL: word/char counts, reading time, language.
+
+    Fetches the page (same _fetch as /api/preview), strips HTML to visible
+    text, and reports:
+      * word_count, char_count, char_count_no_spaces
+      * reading_time_seconds (200 wpm default, configurable via ?wpm=)
+      * sentence_count, avg_word_length
+      * top_words (10 most frequent, stopwords excluded, configurable via ?top=)
+      * title (the page <title>)
+
+    Useful for content-quality checks, SEO tooling, and accessibility audits.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+        final_url, html_text, _ = _fetch(url)
+    except _FETCH_EXC as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+
+    # Parse <title> for context (cheap; reuses existing parser).
+    head_html = _extract_head(html_text)
+    title_parser = _PeekParser(final_url)
+    try:
+        title_parser.feed(head_html)
+    except AssertionError:
+        pass
+    page_title = _clean(title_parser.title)
+
+    # Strip tags to visible text.
+    extractor = _TextExtractor()
+    try:
+        extractor.feed(html_text)
+    except AssertionError:
+        pass
+    text = extractor.text()
+    # Collapse whitespace.
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # Word-level stats.
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'\-]*", text)
+    word_count = len(words)
+    char_count = len(text)
+    char_count_no_spaces = len(text.replace(" ", "").replace("\t", ""))
+
+    # Sentence count: naive split on .!?  followed by space/end.
+    sentence_count = max(1, len(re.findall(r"[.!?]+(?:\s|$)", text)))
+    avg_word_length = (
+        round(sum(len(w) for w in words) / word_count, 2) if word_count else 0
+    )
+
+    # Reading time (default 200 wpm; /api/word-count?wpm=250).
+    try:
+        wpm = max(50, min(1000, int(request.values.get("wpm") or 200)))
+    except ValueError:
+        wpm = 200
+    reading_time_seconds = round((word_count / wpm) * 60) if word_count else 0
+
+    # Top-N words by frequency (English stopwords only — keeps it stdlib).
+    _STOP = {
+        "the", "a", "an", "and", "or", "but", "if", "then", "else", "for",
+        "of", "to", "in", "on", "at", "by", "with", "as", "is", "are", "was",
+        "were", "be", "been", "being", "this", "that", "these", "those", "it",
+        "its", "from", "has", "have", "had", "not", "no", "do", "does", "did",
+        "will", "would", "could", "should", "can", "may", "might", "must",
+        "i", "you", "he", "she", "we", "they", "them", "him", "her", "us",
+        "me", "my", "your", "his", "our", "their", "so", "than", "too", "very",
+    }
+    try:
+        top_n = max(1, min(50, int(request.values.get("top") or 10)))
+    except ValueError:
+        top_n = 10
+    freq: dict[str, int] = {}
+    for w in words:
+        wl = w.lower()
+        if len(wl) < 3 or wl in _STOP:
+            continue
+        freq[wl] = freq.get(wl, 0) + 1
+    top_words = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))[:top_n]
+    top_words_out = [{"word": w, "count": c} for w, c in top_words]
+
+    out = {
+        "url": final_url,
+        "title": page_title,
+        "word_count": word_count,
+        "char_count": char_count,
+        "char_count_no_spaces": char_count_no_spaces,
+        "sentence_count": sentence_count,
+        "avg_word_length": avg_word_length,
+        "reading_time_seconds": reading_time_seconds,
+        "reading_wpm": wpm,
+        "top_words": top_words_out,
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "word-count:%s" % final_url[:150])
+    return jsonify(out)
+
+
 @app.route("/api/status")
 def api_status():
     """Self-describing service manifest (1.2.0): version, uptime, and the
     full list of registered API routes with their methods. Useful for SDK
     clients and for a landing-page client to render an endpoint catalogue
-    dynamically. New in 1.3.0: /api/oembed (oEmbed link provider),
-    /api/shortlink + /lp/<code> (base62 short links), SSRF guard in
-    _normalize_url. Earlier: /api/favicons (image proxy), /api/robots
+    dynamically. New in 1.4.0: /api/rss (RSS/Atom feed detection + parse),
+    /api/word-count (content statistics). 1.3.0: /api/oembed (oEmbed link
+    provider), /api/shortlink + /lp/<code> (base62 short links), SSRF guard
+    in _normalize_url. Earlier: /api/favicons (image proxy), /api/robots
     (robots.txt as JSON), /api/headers (headers-only fetch)."""
     routes = sorted(
         (

@@ -46,3 +46,8 @@
 | 2026-08-06 | free | ip:127.0.0.1 | oembed:https://github.com |
 | 2026-08-06 | free | ip:127.0.0.1 | shortlink:create |
 | 2026-08-06 | free | ip:127.0.0.1 | https://example.com |
+| 2026-08-06 | free | ip:43.130.228.73 | shortlink:reissue |
+| 2026-08-06 | free | ip:43.165.198.5 | oembed:https://example.com |
+| 2026-08-06 | free | ip:127.0.0.1 | rss:https://github.blog/ |
+| 2026-08-06 | free | ip:127.0.0.1 | word-count:https://example.com |
+| 2026-08-06 | free | ip:127.0.0.1 | https://github.com |

@@ -15,6 +15,22 @@ Flask app. Two tiers (matches `decorators.py`):
 - `GET /api/subscribe?email=` — **revenue path**: mints a **Pro** API key (never
   expires, persisted to `keys.json`) and returns a self-serve **payment link**.
   Response includes `api_key`, `pay_url`, `pay_method`, `price_usd`, `instructions`.
+- `GET /api/extract?url=` — raw meta + links + headings (deeper crawl)
+- `GET /api/metadata-full?url=` — full metadata dump (every meta tag)
+- `GET /api/batch?urls=` — up to 5 URLs at once (parallel fetch)
+- `GET /api/diff?url1=&url2=` — compare two URLs' metadata
+- `GET /api/favicons?url=` — proxy favicon image bytes
+- `GET /api/robots?url=` — parse robots.txt as JSON
+- `GET /api/headers?url=` — HTTP response headers only
+- `GET /api/oembed?url=` — oEmbed 1.0 "link" provider JSON
+- `GET /api/shortlink?url=` — create/resolve base62 short links
+- `GET /lp/<code>` — 302 redirect for a short code
+- `GET /api/screenshot-url-hint?url=` — suggestion for screenshot service URL
+- `GET /api/opengraph?url=` — OpenGraph-only metadata extraction
+- `GET /api/validate-key?key=` — validate an API key
+- `GET /api/status` — version + endpoint listing (discovery)
+- `GET /api/rss?url=` — RSS/Atom feed detection + parsing (NEW in 1.4.0)
+- `GET /api/word-count?url=` — content stats: word count, reading time, top terms (NEW in 1.4.0)
 - `GET /api/health` — `{ok, today:{day, count}}`
 
 The Pro key works immediately at `/api/preview?key=<pro_key>` — `quota.limit`

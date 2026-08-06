@@ -113,6 +113,19 @@ PRO_PRICE_USD = float(os.environ.get("LINKPEEK_PRO_PRICE", "5"))
 PAYPAL_ME = os.environ.get("LINKPEEK_PAYPAL_ME", "").rstrip("/")
 STRIPE_LINK = os.environ.get("LINKPEEK_STRIPE_LINK", "").rstrip("/")
 
+# NowPayments crypto checkout — fully programmatic; the /v1/invoice endpoint
+# accepts a plaintext API key via `x-api-key` and returns a hosted invoice URL.
+# Operator only generates an API key once on https://nowpayments.io (no bank
+# account, no KYC for the key) and pastes it here. Buyers pay in USDC/ETH/BTC
+# and NowPayments fires an IPN callback — no human per-buyer setup.
+NOWPAYMENTS_API_KEY = os.environ.get("LINKPEEK_NOWPAYMENTS_KEY", "").strip()
+NOWPAYMENTS_API = os.environ.get(
+    "LINKPEEK_NOWPAYMENTS_API", "https://api.nowpayments.io/v1"
+)
+# Public callback URL the operator sets so NowPayments posts IPN to our gate.
+# If unset we still issue the invoice (NowPayments will just not callback).
+NOWPAYMENTS_IPN_URL = os.environ.get("LINKPEEK_NOWPAYMENTS_IPN", "").strip()
+
 
 def issue_pro_key(email: str) -> str:
     """Mint a non-expiring Pro API key for an email. Returns the key string.
@@ -141,14 +154,59 @@ def issue_pro_key(email: str) -> str:
     return key
 
 
+def _nowpayments_invoice(email: str, key: str) -> dict:
+    """Create a NowPayments hosted invoice for one Pro signup.
+
+    Returns a dict {invoice_url, invoice_id, pay_address} on success, or an
+    empty dict on any HTTP/JSON error (caller falls through). Uses only the
+    stdlib via urllib so no new deps. The path /v1/invoice is public and was
+    confirmed live against api.nowpayments.io (2026-08)."""
+    import urllib.request
+    import secrets as _s
+
+    order_id = "lp_{}_{}".format(_utc_day(), _s.token_hex(6))
+    payload = {
+        "price_amount": PRO_PRICE_USD,
+        "price_currency": "usd",
+        "order_id": order_id,
+        "order_description": "LinkPeek Pro - {} - monthly".format(email),
+        "ipn_callback_url": NOWPAYMENTS_IPN_URL or "https://example.com/ipn",
+        "success_url": "https://linkpeek.local/pro?ok=1&key={}".format(key),
+        "cancel_url": "https://linkpeek.local/",
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        NOWPAYMENTS_API + "/invoice",
+        data=data,
+        headers={
+            "x-api-key": NOWPAYMENTS_API_KEY,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", "replace")
+        parsed = json.loads(body) if body else {}
+        return {
+            "invoice_url": parsed.get("invoice_url", "") or parsed.get("id", ""),
+            "invoice_id": parsed.get("id", ""),
+            "pay_address": parsed.get("pay_address", ""),
+            "raw": parsed,
+        }
+    except Exception:
+        return {}  # never let payment creation break the signup response
+
+
 def subscribe(email: str, host: str = "") -> dict:
     """Self-serve Pro signup. Issues a Pro key and returns a payment link.
 
     Returns a dict with: email, api_key, plan, price_usd, pay_url, pay_method,
     instructions. The pay_url is whichever payment primitive the operator has
-    configured (PayPal Me or Stripe Payment Link). If neither is set, we fall
-    back to a mailto: link asking the user to email the operator — still a
-    working, $0-cost path that needs no third-party account."""
+    configured. Priority: NowPayments crypto (programmatic), Stripe Payment
+    Link, PayPal Me, then mailto fallback. If none is set, we fall back to a
+    mailto: link asking the user to email the operator — still a working,
+    $0-cost path that needs no third-party account."""
     email = (email or "").strip().lower()
     if not email or "@" not in email:
         raise ValueError("valid email required")
@@ -157,17 +215,32 @@ def subscribe(email: str, host: str = "") -> dict:
 
     pay_url = ""
     pay_method = ""
-    if STRIPE_LINK:
+    pay_meta = {}
+    if NOWPAYMENTS_API_KEY:
+        inv = _nowpayments_invoice(email, api_key)
+        if inv.get("invoice_url"):
+            pay_url = str(inv["invoice_url"])
+            pay_method = "nowpayments_crypto"
+            pay_meta = {
+                "invoice_id": inv.get("invoice_id", ""),
+                "pay_address": inv.get("pay_address", ""),
+                "accepted_coins": "USDC (Base), ETH, BTC, USDT, and 60+",
+            }
+
+    # Separate chain (not elif on the NowPayments block) so that a failed
+    # NowPayments invoice — key set but API down — still falls through to a
+    # working pay_url instead of returning an empty one.
+    if not pay_url and STRIPE_LINK:
         # Stripe Payment Link: append the customer email so reconciliation is automatic.
         sep = "&" if "?" in STRIPE_LINK else "?"
         pay_url = "{}{}prefilled_email={}".format(STRIPE_LINK, sep, urllib.parse.quote(email))
         pay_method = "stripe"
-    elif PAYPAL_ME:
+    elif not pay_url and PAYPAL_ME:
         # PayPal Me: amount goes in the path, email shows up in the notification
         # the operator receives — they match it against the subscribed email.
         pay_url = "{}/{:.2f}".format(PAYPAL_ME, PRO_PRICE_USD)
         pay_method = "paypal"
-    else:
+    elif not pay_url:
         # Last-resort $0 path: a mailto asking the buyer to email the operator.
         pay_url = (
             "mailto:linkpeek@localhost?subject=LinkPeek%20Pro%20${:.0f}/mo"
@@ -195,6 +268,7 @@ def subscribe(email: str, host: str = "") -> dict:
         "currency": "USD",
         "pay_url": pay_url,
         "pay_method": pay_method,
+        "pay_meta": pay_meta,  # invoice_id, pay_address, accepted_coins (crypto)
         "next_steps": [
             "1. Your Pro key is live NOW — it already works at {:,} requests/day.".format(PRO_DAILY_LIMIT),
             "2. Open pay_url and pay ${:.0f} to keep it after this billing cycle.".format(PRO_PRICE_USD),

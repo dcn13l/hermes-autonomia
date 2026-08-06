@@ -24,6 +24,8 @@ Single Flask app. Endpoints:
     GET  /api/meta-tags        flat key→value map of every head meta tag
     GET  /api/tech-stack       detect frameworks/CMS/analytics from HTML + headers
     GET  /api/pdf-info         extract PDF metadata (version, page count, title…)
+    GET  /api/sitemap-parse    parse a sitemap.xml URL into {urls:[…], sitemaps:[…]}
+    GET  /api/og-image-proxy   fetch + proxy an og:image/the twitter:image bytes
     GET  /lp/<code>            302-redirect for a short code
 """
 
@@ -83,7 +85,7 @@ _FETCH_EXC = (
 )
 
 # Service metadata for /api/status
-__version__ = "1.6.0"
+__version__ = "1.7.1"
 _START_TIME = time.time()
 
 
@@ -1490,6 +1492,213 @@ def api_links():
 
 
 # ============================================================================
+# Sitemap.xml parser (1.7.1) — stdlib xml.etree, same _ET as /api/rss
+# ============================================================================
+# Parses a sitemap.xml URL into a flat list of <loc> URLs plus any nested
+# <sitemap> entries (sitemap index files). Handles both <urlset> (a regular
+# sitemap) and <sitemapindex> (a sitemap-of-sitemaps). Returns up to 500 URLs so
+# a single call can't exhaust memory on a million-URL sitemap; pagination is
+# left to the caller (the upstream sitemap slice is theirs to page through).
+_SITEMAP_MAX_URLS = 500
+_SITEMAP_MAX_FETCH = 5 * 1024 * 1024  # 5 MiB body cap — sitemaps can be large
+
+
+def _parse_sitemap_xml(xml_text: str) -> dict:
+    """Parse sitemap / sitemapindex XML into {type, urls, sitemaps, lastmod[]}.
+
+    Raises ValueError on a non-sitemap root or unparseable XML.
+    """
+    if not _XML_AVAILABLE:
+        raise ValueError("xml.etree unavailable")
+    if not xml_text or not xml_text.strip():
+        raise ValueError("empty sitemap body")
+    try:
+        root = _ET.fromstring(xml_text)
+    except _ET.ParseError as e:
+        raise ValueError("xml_parse_error: %s" % str(e))
+
+    root_local = _strip_ns(root.tag).lower()
+    if root_local == "urlset":
+        sm_type = "urlset"
+    elif root_local == "sitemapindex":
+        sm_type = "sitemapindex"
+    else:
+        raise ValueError(
+            "not a recognized sitemap root (<urlset> or <sitemapindex>): got <%s>"
+            % root_local
+        )
+
+    urls = []
+    sitemaps = []
+    lastmods = []
+    for child in root:
+        child_local = _strip_ns(child.tag).lower()
+        loc = ""
+        lm = ""
+        for sub in child:
+            sub_local = _strip_ns(sub.tag).lower()
+            if sub_local == "loc" and sub.text:
+                loc = sub.text.strip()
+            elif sub_local == "lastmod" and sub.text:
+                lm = sub.text.strip()
+        if not loc:
+            continue
+        if sm_type == "urlset":
+            urls.append(loc)
+            lastmods.append(lm)
+        else:  # sitemapindex
+            sitemaps.append({"loc": loc, "lastmod": lm})
+    return {
+        "type": sm_type,
+        "urls": urls[:_SITEMAP_MAX_URLS],
+        "url_total": len(urls),
+        "url_truncated": len(urls) > _SITEMAP_MAX_URLS,
+        "sitemaps": sitemaps,
+        "lastmods": lastmods[:_SITEMAP_MAX_URLS],
+    }
+
+
+@app.route("/api/sitemap-parse")
+@rate_limit(app)
+def api_sitemap_parse():
+    """Parse a sitemap.xml (or sitemap index) URL into structured JSON.
+
+    Query: ?url=https://.../sitemap.xml  (required)
+
+    Fetches the URL, parses the XML body, and returns:
+      * type      — "urlset" or "sitemapindex"
+      * urls      — up to 500 <loc> URLs from a <urlset>
+      * sitemaps   — [{loc, lastmod}] from a <sitemapindex>
+      * url_total  — actual count before the 500 cap
+      * url_truncated — true if url_total > 500
+
+    Auto-detects <urlset> vs <sitemapindex>. Uses the same stdlib xml.etree as
+    /api/rss; no new deps. 415 if the URL does not serve XML, 502 on fetch
+    failure, 422 on a parse error.
+    """
+    if not _XML_AVAILABLE:
+        return jsonify(error="xml.etree unavailable on this server"), 503
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://.../sitemap.xml"), 400
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    opener = build_opener(ProxyHandler())
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; LinkPeek/1.0; +https://github.com/linkpeek)",
+            "Accept": "application/xml,text/xml,*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate",
+        },
+        method="GET",
+    )
+    try:
+        resp = opener.open(req, timeout=10.0)
+    except HTTPError as e:
+        return jsonify(url=url, error="fetch_failed: HTTP %s" % getattr(e, "code", "?")), 502
+    except _FETCH_EXC as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    raw = resp.read(_SITEMAP_MAX_FETCH)
+    final_url = resp.geturl()
+    # Decode (reusing _decode handles gzip/deflate/charset sniffing).
+    try:
+        xml_text = _decode(raw, resp.headers)
+    except Exception:
+        xml_text = raw.decode("utf-8", errors="ignore")
+    looks_xml = "xml" in ctype or xml_text.lstrip().startswith("<")
+    if not looks_xml:
+        return jsonify(
+            url=final_url,
+            content_type=ctype,
+            error="not_xml (Content-Type/body not XML)",
+        ), 415
+    try:
+        out = _parse_sitemap_xml(xml_text)
+    except ValueError as e:
+        return jsonify(url=final_url, error="sitemap_parse_failed: %s" % e), 422
+    out["url"] = final_url
+    out["content_type"] = ctype
+    out["byte_size"] = len(raw)
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "sitemap:%s" % final_url[:150])
+    return jsonify(out)
+
+
+# ============================================================================
+# OG image proxy (1.7.1) — fetch + stream the og:image bytes for a page
+# ============================================================================
+# Many link-card renderers (Discord, Slack, embedded CMSes) can't fetch an
+# arbitrary og:image URL because of CORS / mixed-content / hotlink protection.
+# This endpoint resolves the og:image (or twitter:image) for a page the same
+# way /api/preview does, fetches it, and streams the bytes back with the
+# upstream Content-Type — so a <img src="/api/og-image-proxy?url=…"> just works.
+# ?size= caps the byte cap (default 2 MiB, ceiling 10 MiB) so a caller can't
+# turn this into a memory-exhaustion vector.
+
+@app.route("/api/og-image-proxy")
+@rate_limit(app)
+def api_og_image_proxy():
+    """Fetch and proxy the og:image (or twitter:image) bytes for a page URL.
+
+    Query: ?url=https://...        (the page whose image you want, not the image)
+    Optional: ?size=2097152        byte cap on the proxied image (default 2 MiB,
+                                   floor 1 KiB, ceiling 10 MiB)
+
+    Returns the raw image bytes with the upstream Content-Type and a long
+    Cache-Control, so a browser <img> tag works without CORS tangles. 404 if
+    the page has no og:image / twitter:image; 413 if the image exceeds :size;
+    502 on fetch failure.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    _OG_MAX = 10 * 1024 * 1024
+    max_bytes = 2 * 1024 * 1024
+    try:
+        max_bytes = max(1024, min(_OG_MAX, int(request.values.get("size") or max_bytes)))
+    except ValueError:
+        pass
+    try:
+        preview = preview_link(url)
+    except _FETCH_EXC as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+    image_url = preview.get("image") or ""
+    if not image_url or image_url.startswith("data:"):
+        return jsonify(url=url, error="no_og_image_found"), 404
+    opener = build_opener(ProxyHandler())
+    req = Request(
+        image_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; LinkPeek/1.0; +https://github.com/linkpeek)",
+            "Accept": "image/*,*/*;q=0.8",
+        },
+        method="GET",
+    )
+    try:
+        resp = opener.open(req, timeout=10.0)
+    except (URLError, HTTPError, socket.timeout, ConnectionError, OSError, ssl.SSLError) as e:
+        return jsonify(url=image_url, error="image_fetch_failed: %s" % type(e).__name__), 502
+    body = resp.read(max_bytes + 1)
+    if len(body) > max_bytes:
+        return jsonify(url=image_url, error="image_too_large", limit=max_bytes), 413
+    ctype = (resp.headers.get("Content-Type") or "application/octet-stream").split(";")[0].strip()
+    final_image_url = resp.geturl()
+    record_billing(g.meter_key, g.plan, "og-image:%s" % (preview.get("url", "")[:150]))
+    return Response(
+        body,
+        mimetype=ctype,
+        headers={
+            "Cache-Control": "public, max-age=3600",
+            "X-LinkPeek-Source-Image": final_image_url[:500],
+        },
+    )
+
+
+# ============================================================================
 # Flat meta-tag listing (1.5.0) — every meta tag as key→value pairs
 # ============================================================================
 @app.route("/api/meta-tags")
@@ -1904,10 +2113,16 @@ def api_status():
     """Self-describing service manifest (1.2.0): version, uptime, and the
     full list of registered API routes with their methods. Useful for SDK
     clients and for a landing-page client to render an endpoint catalogue
-    dynamically. New in 1.6.0: /api/tech-stack (framework/CMS fingerprinting
-    from HTML + headers), /api/pdf-info (stdlib-only PDF metadata extraction),
-    bug fixes (links cap that truncated /api/links; NameError on /api/diff
-    timeout path).
+    dynamically.
+    New in 1.7.1: /api/sitemap-parse (parses sitemap.xml URL → URLs+sub-sitemaps),
+    /api/og-image-proxy (proxies the og:image bytes for a page, with a byte cap),
+    decorators.py type-annotation corruption fix (``***`` -> ``str``).
+    New in 1.7.0: /api/qr 503 on missing PIL, /api/key trial_days from env,
+    /api/favicons max-byte cap (DoS guard), tech-stack regex simplification +
+    /api/pdf-info page count fix, /api/links cap that truncated /api/links,
+    NameError on /api/diff timeout path.
+    New in 1.6.0: /api/tech-stack (framework/CMS fingerprinting
+    from HTML + headers), /api/pdf-info (stdlib-only PDF metadata extraction).
     New in 1.5.0: /api/links (link extraction, classified
     internal/external), /api/meta-tags (flat meta key→value map).
     New in 1.4.0: /api/rss, /api/word-count. 1.3.0: /api/oembed,

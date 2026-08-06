@@ -112,5 +112,37 @@
     "issued": "2026-08-06",
     "expires": "2026-08-27",
     "expires_ts": 1787860823
+  },
+  "lp_pro_hF6NX-40CBG1mB5GW2LzDA": {
+    "email": "eth@example.com",
+    "plan": "pro",
+    "issued": "2026-08-06",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
+  },
+  "lp_pro_GysXJewqEiY0KqsjvYCz1A": {
+    "email": "a@b.com",
+    "plan": "pro",
+    "issued": "2026-08-06",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
+  },
+  "lp_pro_9rwSrCsqCQ9F4j5PJgG9ew": {
+    "email": "alice@example.com",
+    "plan": "pro",
+    "issued": "2026-08-06",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
+  },
+  "lp_pro_RSvvcDm8jAAm6jnBqrWhAw": {
+    "email": "bob@example.com",
+    "plan": "pro",
+    "issued": "2026-08-06",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
   }
 }

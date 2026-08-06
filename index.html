@@ -29,7 +29,7 @@ a { color:var(--accent); }
 <p class="tagline">Title, description, og:image & favicon for any URL — in one JSON call.</p>
 <p class="body-copy">Add rich link previews to your Discord or Slack bot in minutes. <strong>One GET request</strong> returns OpenGraph metadata, ready to render.</p>
 <code><span class="c"># Free — no key</span>
-curl <span class="s">"http://147.15.103.217:5000/api/preview?url=https://github.com"</span>
+curl <span class="s">"http://147.15.103.217.sslip.io/api/preview?url=https://github.com"</span>
 
 <span class="c"># -></span> {
 <span class="c">#</span>   <span class="k">"title"</span>: <span class="s">"GitHub: Let's build from here"</span>,
@@ -46,17 +46,17 @@ curl <span class="s">"http://147.15.103.217:5000/api/preview?url=https://github.
     style="display:none;margin-top:0.75rem;background:var(--code-bg);border:1px solid var(--border);border-radius:6px;padding:0.8rem;font-size:0.78rem;overflow-x:auto;max-height:280px;color:#c9d1d9"></pre>
 </div>
 <div class="pricing">
-  <div class="tier"><h2>Free</h2><div class="price">$0 <span>/ forever</span></div><ul><li>100 requests / day</li><li>No key required</li><li>All endpoints</li></ul><a class="btn outline" href="http://147.15.103.217:5000/api/preview?url=https://example.com">Try it now</a></div>
+  <div class="tier"><h2>Free</h2><div class="price">$0 <span>/ forever</span></div><ul><li>100 requests / day</li><li>No key required</li><li>All endpoints</li></ul><a class="btn outline" href="http://147.15.103.217.sslip.io/api/preview?url=https://example.com">Try it now</a></div>
   <div class="tier pro"><h2>Pro</h2><div class="price">$5 <span>/ month</span></div><ul><li>50,000 requests / day</li><li>Priority parsing</li><li>Usage dashboard</li><li>Non-expiring API key</li></ul>
     <form id="pro-form" onsubmit="return linkpeekSubscribe(event)" style="margin-top:0.75rem">
       <input id="pro-email" type="email" placeholder="you@email.com" required style="width:100%;padding:0.55rem;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.9rem;margin-bottom:0.5rem">
       <button class="btn pay" type="submit" style="width:100%">Get Pro — $5/mo via PayPal</button>
     </form>
     <div id="pro-result" style="display:none;margin-top:0.75rem;padding:0.9rem;border:1px solid var(--accent2);border-radius:8px;background:#0d2818;font-size:0.85rem"></div>
-    <a class="btn outline" href="http://147.15.103.217:5000/api/key?email=you@example.com" style="margin-top:0.5rem">Or start 14-day trial</a>
+    <a class="btn outline" href="http://147.15.103.217.sslip.io/api/key?email=you@example.com" style="margin-top:0.5rem">Or start 14-day trial</a>
   </div>
 </div>
-<p class="body-copy">Also try our <a href="http://147.15.103.217:5000/api/qr?text=hello">QR Code API</a>, the <a href="http://147.15.103.217:5000/api/oembed?url=https://example.com">oEmbed provider</a>, our <a href="http://147.15.103.217:5000/api/shortlink?url=https://example.com">short-link API</a>, the <a href="http://147.15.103.217:5000/api/rss?url=https://github.com/blog">RSS feed parser</a>, or <a href="http://147.15.103.217:5000/api/word-count?url=https://example.com">content word-count stats</a>.</p>
+<p class="body-copy">Also try our <a href="http://147.15.103.217.sslip.io/api/qr?text=hello">QR Code API</a>, the <a href="http://147.15.103.217.sslip.io/api/oembed?url=https://example.com">oEmbed provider</a>, our <a href="http://147.15.103.217.sslip.io/api/shortlink?url=https://example.com">short-link API</a>, the <a href="http://147.15.103.217.sslip.io/api/rss?url=https://github.com/blog">RSS feed parser</a>, <a href="http://147.15.103.217.sslip.io/api/word-count?url=https://example.com">content word-count stats</a>, the <a href="http://147.15.103.217.sslip.io/api/sitemap-parse?url=https://example.com/sitemap.xml">sitemap parser</a>, or the <a href="http://147.15.103.217.sslip.io/api/og-image-proxy?url=https://example.com">OG image proxy</a>.</p>
 <div class="footer">Built and operated by an autonomous AI agent 24/7 on Oracle Cloud. <a href="https://github.com/dcn13l/hermes-autonomia">Source on GitHub</a></div>
 <script>
 // Self-serve Pro signup: calls /api/subscribe and renders the Pro API key + payment link.

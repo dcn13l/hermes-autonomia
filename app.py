@@ -22,6 +22,8 @@ Single Flask app. Endpoints:
     GET  /api/rss              detect + parse RSS/Atom feed for a URL
     GET  /api/links            extract all links, classified internal/external
     GET  /api/meta-tags        flat key→value map of every head meta tag
+    GET  /api/tech-stack       detect frameworks/CMS/analytics from HTML + headers
+    GET  /api/pdf-info         extract PDF metadata (version, page count, title…)
     GET  /lp/<code>            302-redirect for a short code
 """
 
@@ -51,6 +53,7 @@ from decorators import (
     daily_totals,
     record_billing,
     subscribe,
+    donate_channels,
     key_status,
     plan_catalog,
 )
@@ -80,7 +83,7 @@ _FETCH_EXC = (
 )
 
 # Service metadata for /api/status
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 _START_TIME = time.time()
 
 
@@ -362,7 +365,11 @@ def preview_link(url: str, collect_body: bool = False) -> dict:
     }
     if collect_body:
         result["headings"] = parser.headings[:50]
-        result["links"] = parser.links[:100]
+        # NOTE: keep this cap large enough to satisfy /api/links?limit= (max 500);
+        # preview_link() callers below apply their own [:limit_clamped] slice.
+        # Historically this was [:100] which silently truncated /api/links to
+        # 100 results regardless of the ?limit= the caller asked for — fix #1.
+        result["links"] = parser.links[:500]
         result["meta"] = parser.meta
     return result
 
@@ -608,6 +615,15 @@ def api_subscribe():
     return jsonify(result)
 
 
+@app.route("/api/donate")
+def api_donate():
+    """Free donation/tip channels — Buy Me a Coffee, Ko-fi, GitHub Sponsors.
+    Unauthenticated, read-only, $0 fixed cost.  No API keys or merchant
+    account required; the operator just sets one LINKPEEK_BMC /
+    LINKPEEK_KOFI / LINKPEEK_GH_SPONSORS env var to a profile URL."""
+    return jsonify(donate_channels())
+
+
 @app.route("/api/pricing")
 def api_pricing():
     """Public plan catalogue: free vs trial vs pro pricing and limits.
@@ -670,8 +686,8 @@ def api_diff():
         except Exception as e:
             return {"url": u, "error": "fetch_failed: %s" % type(e).__name__}
 
-    import concurrent.futures
-    _FutTimeout = concurrent.futures.TimeoutError
+    import concurrent.futures as _cf
+    _FutTimeout = _cf.TimeoutError
     with ThreadPoolExecutor(max_workers=2) as ex:
         f1, f2 = ex.submit(_one, u1), ex.submit(_one, u2)
         try:
@@ -1502,12 +1518,386 @@ def api_meta_tags():
     return jsonify(out)
 
 
+# ============================================================================
+# Tech-stack detection (1.6.0) — stdlib regex heuristics, no JS execution
+# ============================================================================
+# Detects front-end frameworks/libraries/CMSes from static HTML fingerprints:
+# <script src="..."> paths, inline script patterns, <meta name="generator">,
+# data-* attributes, and CSS class conventions. Does NOT run JavaScript, so
+# client-only SPA frameworks may be missed when server rendering is absent.
+
+_TECH_SIGNATURES = [
+    # (name, list of compiled regexes — any match => detected)
+    ("React", [
+        re.compile(r"data-react(?:root|-hmr|-app|id)", re.I),
+        re.compile(r"\breact(?:\.development|\.production)?(?:\.min)?\.js", re.I),
+        re.compile(r"__REACT_DEVTOOLS_GLOBAL_HOOK__", re.I),
+    ]),
+    ("Next.js", [
+        re.compile(r"__NEXT_DATA__", re.I),
+        re.compile(r"/_next/static/", re.I),
+        re.compile(r"id=\"__next\"", re.I),
+    ]),
+    ("Vue.js", [
+        re.compile(r"\bvue(?:\.runtime)?(?:\.min)?\.js", re.I),
+        re.compile(r"data-v-[0-9a-f]{8}", re.I),
+        re.compile(r"<!--\s*if\s*-->", re.I),  # server-rendered Vue SSR comments
+    ]),
+    ("Nuxt", [
+        re.compile(r"window\.__NUXT__", re.I),
+        re.compile(r"data-nuxt", re.I),
+        re.compile(r"/_nuxt/", re.I),
+    ]),
+    ("Angular", [
+        re.compile(r"ng-app|ng-controller|ng-version", re.I),
+        re.compile(r"@angular/", re.I),
+    ]),
+    ("Svelte", [
+        re.compile(r"\.svelte-\w+", re.I),  # Svelte component class hashes
+    ]),
+    ("jQuery", [
+        re.compile(r"\bjquery(?:-\d[\d.]*)?(?:\.min)?\.js", re.I),
+        re.compile(r"jQuery v([\d.]+)"),
+    ]),
+    ("Bootstrap", [
+        re.compile(r"\bbootstrap(?:\.bundle)?(?:\.min)?\.(?:js|css)", re.I),
+    ]),
+    ("Tailwind CSS", [
+        re.compile(r"\btailwind(?:\.min)?\.css", re.I),
+        re.compile(r"\bclass=\"[^\"]*\b(flex|grid|p-\d|m-\d|text-\w+-\d)\b", re.I),
+    ]),
+    ("Bulma", [
+        re.compile(r"\bbulma(?:\.min)?\.css", re.I),
+    ]),
+    ("WordPress", [
+        re.compile(r"<meta[^>]+name=\"generator\"[^>]+content=\"WordPress", re.I),
+        re.compile(r"/wp-content/", re.I),
+        re.compile(r"/wp-includes/", re.I),
+    ]),
+    ("Drupal", [
+        re.compile(r"<meta[^>]+name=\"generator\"[^>]+content=\"Drupal", re.I),
+        re.compile(r"\bdrupal\.js", re.I),
+    ]),
+    ("Shopify", [
+        re.compile(r"cdn\.shopify\.com", re.I),
+        re.compile(r"Shopify\.theme|window\.Shopify", re.I),
+    ]),
+    ("Squarespace", [
+        re.compile(r"<meta[^>]+name=\"generator\"[^>]+content=\"Squarespace", re.I),
+        re.compile(r"static1\.squarespace\.com", re.I),
+    ]),
+    ("Gatsby", [
+        re.compile(r"___gatsby", re.I),
+        re.compile(r"/gatsby-", re.I),
+    ]),
+    ("Hugo", [
+        re.compile(r"<meta[^>]+name=\"generator\"[^>]+content=\"Hugo", re.I),
+    ]),
+    ("Jekyll", [
+        re.compile(r"<meta[^>]+name=\"generator\"[^>]+content=\"Jekyll", re.I),
+    ]),
+    ("Cloudflare", [
+        re.compile(r"cdn-cgi/", re.I),
+        re.compile(r"__cf_bm", re.I),
+    ]),
+    ("Google Analytics", [
+        re.compile(r"google-analytics\.com/(?:analytics|ga)\.js", re.I),
+        re.compile(r"gtag/js\?id=UA-", re.I),
+        re.compile(r"gtag/js\?id=G-", re.I),
+    ]),
+    ("Google Tag Manager", [
+        re.compile(r"googletagmanager\.com/gtm\.js", re.I),
+    ]),
+]
+
+
+def _detect_tech(html_text: str, headers: dict) -> dict:
+    """Scan HTML + headers for framework/CMS fingerprints. Stdlib only."""
+    # Limit scan to first 2 MiB (already capped by _fetch) and lowercased copy
+    # for case-insensitive signature matching without re-lowering per regex.
+    hay = html_text if len(html_text) <= _MAX_BYTES else html_text[:_MAX_BYTES]
+    hay_l = hay.lower()
+    detected = []
+    for name, patterns in _TECH_SIGNATURES:
+        hits = []
+        for rx in patterns:
+            m = rx.search(hay if rx.flags & re.I and "version" in rx.pattern.lower() else hay_l) or rx.search(hay)
+            if m:
+                hits.append({"pattern": rx.pattern[:60]})
+        # For the generator-tag signatures we must scan original-case HTML
+        # because the content attr value can be ignored by .lower(); so we
+        # also fall back to the original-case haystack if nothing matched.
+        if not hits:
+            for rx in patterns:
+                if rx.search(hay):
+                    hits.append({"pattern": rx.pattern[:60]})
+        if hits:
+            detected.append({"name": name, "evidence": hits[:3]})
+    # Generator meta tag (catch-all for CMSes we didn't pre-list).
+    gen_re = re.compile(r'<meta[^>]+name="generator"[^>]+content="([^"]+)"', re.I)
+    gen = gen_re.search(hay)
+    generator = gen.group(1).strip() if gen else ""
+    # Server header often reveals the backend stack too.
+    server = (headers.get("Server") or headers.get("server") or "").strip()
+    powered_by = (headers.get("X-Powered-By") or headers.get("x-powered-by") or "").strip()
+    return {
+        "technologies": detected,
+        "detected_count": len(detected),
+        "generator": generator,
+        "server": server,
+        "x_powered_by": powered_by,
+    }
+
+
+@app.route("/api/tech-stack")
+@rate_limit(app)
+def api_tech_stack():
+    """Detect the front-end / CMS / analytics stack a page is built with.
+
+    Query: ?url=https://...  (required)
+
+    Scans static HTML fingerprints (script paths, data-* attributes, meta
+    generator tag, CSS class conventions) plus the Server / X-Powered-By
+    response headers. No JavaScript is executed, so purely client-rendered
+    SPAs may report fewer frameworks than a real browser visite would.
+
+    Returns: technologies[] (name + evidence patterns), detected_count,
+    generator (raw <meta name=generator> value), server, x_powered_by.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+        final_url, html_text, headers = _fetch(url)
+    except _FETCH_EXC as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+    out = {"url": final_url}
+    out.update(_detect_tech(html_text, headers))
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "tech-stack:%s" % final_url[:150])
+    return jsonify(out)
+
+
+# ============================================================================
+# PDF metadata extraction (1.6.0) — pure-stdlib PDF /info + /XMP parsing
+# ============================================================================
+# Parses the PDF trailer /Info dict and the XMP metadata packet without
+# pulling in a third-party PDF library. Handles the common producer-defined
+# fields: Title, Author, Subject, Keywords, Creator, Producer, CreationDate,
+# ModDate. Falls back gracefully when the trailer is malformed or absent.
+
+_PDF_INFO_KEYS = (
+    "Title", "Author", "Subject", "Keywords",
+    "Creator", "Producer", "CreationDate", "ModDate",
+)
+
+
+def _unescape_pdf_string(raw: str) -> str:
+    """Decode a PDF string literal (the bytes between ( ) or < >) to text."""
+    # Hex string form: <FEFF...> or <48656C6C6F> -> decode hex then UTF-16BE.
+    if raw.startswith("<"):
+        hexbody = raw.strip("<>").replace("\n", "").replace("\r", "").replace(" ", "")
+        try:
+            b = bytes.fromhex(hexbody)
+            if b.startswith(b"\xfe\xff"):
+                return b[2:].decode("utf-16-be", errors="ignore")
+            if b.startswith(b"\xff\xfe"):
+                return b[2:].decode("utf-16-le", errors="ignore")
+            return b.decode("latin-1", errors="ignore")
+        except ValueError:
+            return hexbody
+    # Literal string form: strip outer parens, unescape balanced inner parens
+    # and the common PDF escape sequences. PDF strings nest parens.
+    s = raw.strip()
+    if s.startswith("(") and s.endswith(")"):
+        s = s[1:-1]
+    out_chars = []
+    i = 0
+    escapes = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f",
+               "(": "(", ")": ")", "\\": "\\", "<": "<", ">": ">"}
+    depth = 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and i + 1 < len(s):
+            nxt = s[i + 1]
+            if nxt in escapes:
+                out_chars.append(escapes[nxt])
+                i += 2
+                continue
+            # octal escapes \ddd (1-3 digits)
+            oct_digits = ""
+            j = i + 1
+            while j < len(s) and j < i + 4 and s[j] in "01234567":
+                oct_digits += s[j]
+                j += 1
+            if oct_digits:
+                try:
+                    out_chars.append(chr(int(oct_digits, 8) & 0xFF))
+                except ValueError:
+                    out_chars.append(nxt)
+                i = j
+                continue
+            out_chars.append(nxt)
+            i += 2
+            continue
+        if c == "(":
+            depth += 1
+            out_chars.append(c)
+        elif c == ")":
+            if depth > 0:
+                depth -= 1
+                out_chars.append(c)
+            else:
+                out_chars.append(c)
+        else:
+            out_chars.append(c)
+        i += 1
+    return "".join(out_chars)
+
+
+def _parse_pdf_info(pdf_bytes: bytes) -> dict:
+    """Extract /Info and basic structure metadata from a PDF byte string.
+
+    Returns {} fields set to empty strings when absent. Adds page_count and
+    pdf_version when discoverable. Raises ValueError on non-PDF input.
+    """
+    head = pdf_bytes[:1024]
+    if b"%PDF-" not in head:
+        raise ValueError("not a PDF (missing %PDF- header)")
+    pdf_version = ""
+    mver = re.match(rb"%PDF-(\d+\.\d+)", head)
+    if mver:
+        pdf_version = mver.group(1).decode("ascii", "ignore")
+    info = {k: "" for k in _PDF_INFO_KEYS}
+    # Page count: count /Type /Page occurrences (favour /Type\s*/Page over
+    # /Pages to avoid double counting). Cheap and robust for most PDFs.
+    pages = len(re.findall(rb"/Type\s*/Page[^s/]", pdf_bytes))
+    # Find the trailer /Info dict: /Info <ref> near %%EOF. We scan the last
+    # 64 KiB which contains the trailer for the vast majority of PDFs.
+    tail = pdf_bytes[-65536:] if len(pdf_bytes) > 65536 else pdf_bytes
+    # Pull every "<< ... >>" dict that contains /Title or /Producer; the last
+    # one before EOF that has /Info-ish keys is usually the doc info dict.
+    for key in _PDF_INFO_KEYS:
+        # /Key (literal string)  OR  /Key <hex string>
+        # Capture the *inner* content only (between the () or <>), so the
+        # closing delimiter never leaks into the value. Non-greedy + a
+        # character class that excludes the delimiters handles nested parens
+        # for the common case; deeply-nested strings fall back to "".
+        pat = rb"/" + key.encode("ascii") + rb"\s*(?:\((?:[^()\\]|\\.)*\)|<([0-9A-Fa-f\s]+)>)"
+        for m in re.finditer(pat, tail, re.DOTALL):
+            grp1 = m.group(1)
+            if grp1 is None:
+                # Literal (…) string: re-scan with a parens-aware capture.
+                lit_pat_str = rb"/" + key.encode("ascii") + rb"\s*\(((?:[^()\\]|\\.)*)\)"
+                lm = re.search(lit_pat_str, m.group(0))
+                if lm:
+                    info[key] = _unescape_pdf_string("(" + lm.group(1).decode("latin-1", "ignore") + ")")
+                    if info[key]:
+                        break
+                continue
+            # Hex <…> string: group(1) is the hex body (no delimiters).
+            info[key] = _unescape_pdf_string("<" + grp1.decode("latin-1", "ignore") + ">")
+            if info[key]:
+                break
+    # XMP packet: <?xpacket begin ...> ... <?xpacket end ...>. Pull a few
+    # common dc: tags as a supplement when the Info dict was empty.
+    xmp_re = re.compile(rb"<\?xpacket\b.*?(?:begin|begin=)[^>]*>(.*?)<\?xpacket\b.*?(?:end|end=)[^>]*\?>", re.DOTALL | re.IGNORECASE)
+    xmp_match = xmp_re.search(pdf_bytes)
+    xmp = {}
+    if xmp_match:
+        xmp_text = xmp_match.group(1).decode("utf-8", errors="ignore")
+        for tag in ("dc:title", "dc:creator", "dc:description", "dc:subject", "pdf:Producer", "xmp:CreatorTool"):
+            m = re.search(r"<" + re.escape(tag) + r"\b[^>]*>(.*?)</" + re.escape(tag) + r">", xmp_text, re.DOTALL)
+            if m:
+                # XMP values can be wrapped in <rdf:Seq><rdf:li>; just strip tags.
+                val = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+                if val:
+                    xmp[tag] = val
+    out = {
+        "pdf_version": pdf_version,
+        "page_count": pages,
+        "title": info["Title"] or xmp.get("dc:title", ""),
+        "author": info["Author"] or xmp.get("dc:creator", ""),
+        "subject": info["Subject"] or xmp.get("dc:description", ""),
+        "keywords": info["Keywords"],
+        "keywords_list": ([k.strip() for k in info["Keywords"].split(";") if k.strip()] if info["Keywords"] else []),
+        "creator": info["Creator"] or xmp.get("xmp:CreatorTool", ""),
+        "producer": info["Producer"] or xmp.get("pdf:Producer", ""),
+        "creation_date": info["CreationDate"],
+        "modification_date": info["ModDate"],
+        "has_xmp": bool(xmp_match and xmp),
+        "xmp": xmp if xmp else None,
+    }
+    return out
+
+
+@app.route("/api/pdf-info")
+@rate_limit(app)
+def api_pdf_info():
+    """Extract metadata from a PDF URL: version, page count, title/author/etc.
+
+    Query: ?url=https://.../something.pdf  (required, must point at a PDF)
+
+    Parses the PDF /Info dictionary and the XMP metadata packet using only the
+    Python standard library — no PyPDF2 / pdfminer dependency. Returns version,
+    page_count, title, author, subject, keywords, creator, producer, and the
+    raw creation / modification dates (PDF date string format). 415 if the URL
+    does not serve a PDF, 502 on fetch failure.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    opener = build_opener(ProxyHandler())
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; LinkPeek/1.0; +https://github.com/linkpeek)",
+            "Accept": "application/pdf,application/octet-stream,*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate",
+        },
+        method="GET",
+    )
+    try:
+        resp = opener.open(req, timeout=10.0)
+    except HTTPError as e:
+        return jsonify(url=url, error="fetch_failed: HTTP %s" % getattr(e, "code", "?")), 502
+    except _FETCH_EXC as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    raw = resp.read(_MAX_BYTES)
+    final_url = resp.geturl()
+    # Content-Type hint, but validate by magic bytes — some hosts send
+    # generic Content-Type for .pdf URLs while the body is a real PDF.
+    is_pdf = "pdf" in ctype or raw[:5] == b"%PDF-"
+    if not is_pdf:
+        return jsonify(url=final_url, content_type=ctype,
+                       error="not_a_pdf (Content-Type/bytes not a PDF)"), 415
+    try:
+        info = _parse_pdf_info(raw)
+    except ValueError as e:
+        return jsonify(url=final_url, error="pdf_parse_failed: %s" % e), 422
+    out = {"url": final_url, "content_type": ctype, "byte_size": len(raw)}
+    out.update(info)
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "pdf-info:%s" % final_url[:150])
+    return jsonify(out)
+
+
 @app.route("/api/status")
 def api_status():
     """Self-describing service manifest (1.2.0): version, uptime, and the
     full list of registered API routes with their methods. Useful for SDK
     clients and for a landing-page client to render an endpoint catalogue
-    dynamically. New in 1.5.0: /api/links (link extraction, classified
+    dynamically. New in 1.6.0: /api/tech-stack (framework/CMS fingerprinting
+    from HTML + headers), /api/pdf-info (stdlib-only PDF metadata extraction),
+    bug fixes (links cap that truncated /api/links; NameError on /api/diff
+    timeout path).
+    New in 1.5.0: /api/links (link extraction, classified
     internal/external), /api/meta-tags (flat meta key→value map).
     New in 1.4.0: /api/rss, /api/word-count. 1.3.0: /api/oembed,
     /api/shortlink + /lp/<code>, SSRF guard in _normalize_url.

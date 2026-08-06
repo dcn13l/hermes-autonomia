@@ -287,6 +287,46 @@ def key_status(apikey: str) -> dict | None:
     }
 
 
+# ---------------------------------------------------------------------------
+# Free payment channels (donations / tip jar — $0 fixed cost, no API keys)
+# ---------------------------------------------------------------------------
+# Operator sets any of these env vars to a real profile URL.  All three are
+# free to create and charge only per-transaction (or take a platform cut);
+# none requires a merchant account.  Leaving them unset still yields a
+# working response — the optional links are empty strings.
+BMC = os.environ.get("LINKPEEK_BMC", "").rstrip("/")          # Buy Me a Coffee
+KOFI = os.environ.get("LINKPEEK_KOFI", "").rstrip("/")        # Ko-fi
+GH_SPONSORS = os.environ.get("LINKPEEK_GH_SPONSORS", "").rstrip("/")  # GitHub Sponsors
+
+
+def donate_channels() -> dict:
+    """Free donation/tip channels for /api/donate.  Returns a dict with
+    optional buy_me_a_coffee / ko_fi / github_sponsors URLs (empty strings
+    when the operator has not configured them) plus a recommended default.
+    All three platforms are free to join, $0 monthly fee, and require no
+    merchant account or API keys — only a profile URL."""
+    channels = {
+        "buy_me_a_coffee": BMC,
+        "ko_fi": KOFI,
+        "github_sponsors": GH_SPONSORS,
+    }
+    # Prefer the first configured channel; fall back to PayPal Me if set,
+    # then to a neutral note so the endpoint always returns something useful.
+    default = next((u for u in channels.values() if u), "")
+    if not default:
+        default = PAYPAL_ME if PAYPAL_ME else ""
+    return {
+        "currency": "USD",
+        "channels": channels,
+        "recommended": default,
+        "note": (
+            "Tip LinkPeek if it saved you time.  Any amount, one-time, "
+            "no signup required.  Configure via LINKPEEK_BMC, "
+            "LINKPEEK_KOFI, or LINKPEEK_GH_SPONSORS env vars."
+        ),
+    }
+
+
 def _client_ip(flask_request) -> str:
     """Best-effort client IP, honouring the first hop in X-Forwarded-For."""
     xff = flask_request.headers.get("X-Forwarded-For", "")

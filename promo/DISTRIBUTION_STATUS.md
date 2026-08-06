@@ -38,3 +38,15 @@
 
 ## Honest accounting
 No posts were delivered to a public community from this run. The API was verified live; all marketing copy is written and ready; the blocker on every channel is **authentication credentials not present in this environment** (Reddit 403, Dev.to 401 without key, HN requires human account + karma). The operator must supply credentials or post from their own session. Nothing was invented.
+
+## Run 2 — 2026-08-06 (gh CLI authenticated, social still blocked)
+**Real actions taken this run** (verified gh auth as `dcn13l`):
+- **publicapis.org**: confirmed PR #6266 still OPEN (`daviscodesbugs:add-linkpeek`, opened 2026-06-09, awaiting maintainer review). Added a follow-up comment noting v1.5.0 endpoints: https://github.com/public-apis/public-apis/pull/6266#issuecomment-5207240568
+- **apis.guru**: CONTRIBUTING says use the web form, NOT direct yaml PRs (PRs are auto-reverted). Filed **API request issue #2980** instead with OpenAPI contact + smoke test: https://github.com/APIs-guru/openapi-directory/issues/2980
+- **awesome-openapi3 (APIs-guru)**: list auto-discovers repos tagged `openapi3`. Tagged dcn13l/hermes-autonomia with `openapi3`, `opengraph`, `qr-code`, `link-preview`, `api`, `rest-api`, `flask` via repo topics API (verified).
+- **GitHub repo announcement**: filed **issue #1** on dcn13l/hermes-autonomia — public release announcement with v1.5.0 endpoints, quick start, SDKs, and pointers to the PRs above: https://github.com/dcn13l/hermes-autonomia/issues/1
+- **Dev.to**: BLOCKED — `DEVTO_API_KEY` env absent.
+- **Reddit**: BLOCKED — no creds, draft `reddit_sideproject.md` etc. still unposted.
+- **Hacker News**: BLOCKED — needs human account.
+
+Net new external artifacts this run: 1 issue on apis.guru, 1 release-announcement issue on the product repo, 1 PR comment bump on public-apis, and repo topic-discoverability setup. All social channels remain credential-blocked; promo drafts in this dir are unchanged and ready to paste.

@@ -29,6 +29,9 @@ Single Flask app. Endpoints:
     GET  /api/redirect-chain   follow a URL's HTTP redirects, report every hop
     GET  /api/content-type     GET headers only -> {content_type, charset, server, ...}
     GET  /api/ssl-info         TLS cert + protocol + cipher for an https URL
+    GET  /api/dns-lookup       resolve A/AAAA/CNAME/MX/TXT/NS records via DoH
+    GET  /api/readability      extract main article text (Readability heuristics)
+    GET  /api/og-image         generate a placeholder 1200x630 OG image (PNG)
     GET  /lp/<code>            302-redirect for a short code
 """
 
@@ -63,6 +66,8 @@ from decorators import (
     donate_channels,
     key_status,
     plan_catalog,
+    _load_keys,
+    _save_keys,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -91,7 +96,7 @@ _FETCH_EXC = (
 )
 
 # Service metadata for /api/status
-__version__ = "1.8.4"
+__version__ = "1.8.5"
 _START_TIME = time.time()
 
 
@@ -284,17 +289,33 @@ _PRIVATE_V6 = ("::1", "fc", "fd", "fe80", "fe90", "fea0", "feb0", "fec0", "fed0"
 
 
 def _is_private_host(netloc: str) -> bool:
-    # Strip userinfo and port: "user:pass@host:port" -> "host"
+    # Strip userinfo: "user:pass@host:port" -> "host:port"
     if "@" in netloc:
         netloc = netloc.rsplit("@", 1)[1]
     # Strip bracketed IPv6 [::1]:port -> ::1
     if netloc.startswith("["):
         end = netloc.find("]")
         host = netloc[1:end] if end != -1 else netloc
+        host = host.lower()
+        # Check IPv6 loopback/ULA/link-local prefixes
+        if host == "::1" or host.startswith("::1"):
+            return True
         return any(host.startswith(p) for p in _PRIVATE_V6)
-    # Strip port (v4 or hostname)
-    host = netloc.rsplit(":", 1)[0] if netloc.count(":") == 1 else netloc
-    host = host.lower()
+    # Strip port (v4 or hostname) — but be careful with bare IPv6 (no brackets).
+    # ::1 has colons but is a host, not host:port. Use a regex-free parse.
+    if ":" in netloc:
+        parts = netloc.split(":")
+        # More than one colon → likely bare IPv6 (e.g., "::1", "fe80::1")
+        if len(parts) > 2:
+            host = netloc.lower()
+            # Check IPv6 private prefixes
+            if host == "::1" or host.startswith("::1"):
+                return True
+            return any(host.startswith(p) for p in _PRIVATE_V6)
+        else:
+            host = parts[0].lower()
+    else:
+        host = netloc.lower()
     if host in ("localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"):
         return True
     for rx in _PRIVATE_HOST_RES:
@@ -2659,16 +2680,602 @@ def api_structured_data():
     return jsonify(out)
 
 
+# ============================================================================
+# DNS lookup (1.8.5) — resolve A/AAAA/CNAME/MX/TXT/NS for a domain
+# ============================================================================
+# Uses DNS-over-HTTPS (DoH) via Google's public resolver
+# (https://dns.google/resolve?name=…&type=…) so a single uniform stdlib call
+# path covers EVERY record type — including MX/TXT/CNAME/NS that the stdlib
+# socket module cannot expose. DoH is plain HTTPS to a well-known endpoint,
+# needs no DNS library, and works behind any NAT/firewall that allows 443.
+# It is the most portable stdlib-only DNS approach and keeps the product free
+# of any third-party DNS dependency.
+
+# DNS type numbers as returned by the DoH JSON API (RFC 8484 wire format
+# types, exposed name->code for the pretty-printed response).
+_DNS_TYPE_CODE = {1: "A", 28: "AAAA", 5: "CNAME", 15: "MX", 16: "TXT", 2: "NS"}
+_DNS_TYPE_NAME = {v: k for k, v in _DNS_TYPE_CODE.items()}
+# Record types the endpoint accepts via ?type=; default set covers the
+# common developer use cases. We always normalise to upper-case.
+_DNS_ALLOWED_TYPES = frozenset(_DNS_TYPE_NAME)
+_DNS_DEFAULT_TYPES = ("A", "AAAA", "MX", "TXT", "NS")
+
+
+def _doh_resolve(name: str, rtype: str, timeout: float = 6.0) -> dict:
+    """One DoH query against dns.google for a single record type.
+
+    Returns {type, records: [str], status, ttl} where ``status`` is the
+    DNS RCODE (0=NOERROR, 3=NXDOMAIN, etc.) and ``records`` is the list
+    of bare string data values (MX kept as "priority host", TXT with
+    surrounding quotes stripped). Raises ValueError on a non-NOERROR
+    transport problem; caller decides how to surface RCODE 3.
+    """
+    # dns.google JSON API: GET /resolve?name=…&type=NAME
+    url = "https://dns.google/resolve?name=%s&type=%s" % (
+        urlquote(name, safe=""),
+        rtype,
+    )
+    opener = build_opener(ProxyHandler())
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; LinkPeek/1.0; +https://github.com/linkpeek)",
+            "Accept": "application/dns-json",
+        },
+        method="GET",
+    )
+    try:
+        resp = opener.open(req, timeout=timeout)
+        raw = resp.read(64 * 1024)  # DoH JSON responses are small; cap defensively
+        payload = json.loads(raw.decode("utf-8", errors="ignore"))
+    except (URLError, HTTPError, socket.timeout, ConnectionError, OSError,
+            ssl.SSLError, ValueError) as exc:
+        raise ValueError("doh_failed: %s" % type(exc).__name__)
+
+    status = int(payload.get("Status", -1))
+    answers = payload.get("Answer") or []
+    expected_code = _DNS_TYPE_NAME.get(rtype, 0)
+    records = []
+    ttl = 0
+    for a in answers:
+        # The DoH API echoes the queried type in `Answer[].type`; CNAME
+        # queries sometimes ALSO include the canonical A record, so filter
+        # to only the requested type unless the caller asked for CNAME (in
+        # which case the CNAME target is what they want, not the chain).
+        atype = a.get("type")
+        if rtype != "CNAME" and atype != expected_code:
+            continue
+        data = a.get("data", "")
+        if rtype == "TXT" and isinstance(data, str):
+            # DoH returns TXT values quoted: "v=spf1 -all". Strip ONE pair.
+            if len(data) >= 2 and data[0] == '"' and data[-1] == '"':
+                data = data[1:-1]
+        records.append(data)
+        if a.get("TTL", 0) > ttl:
+            ttl = a.get("TTL")
+    return {"type": rtype, "status": status, "ttl": ttl, "records": records}
+
+
+@app.route("/api/dns-lookup")
+@rate_limit(app)
+def api_dns_lookup():
+    """Resolve DNS records (A/AAAA/CNAME/MX/TXT/NS) for a domain.
+
+    Query:
+      ?domain=example.com          required; a bare hostname or a URL
+                                   (we strip scheme + path + port first)
+      ?type=A,AAAA,MX,TXT,NS       optional comma list; default A,AAAA,MX,TXT,NS
+      ?type=MX                     single type also accepted
+
+    Uses DNS-over-HTTPS against Google's public resolver
+    (https://dns.google/resolve) so every record type — including
+    MX/TXT/CNAME/NS that the stdlib ``socket`` module cannot expose — works
+    through one uniform stdlib HTTPS call. No third-party DNS library.
+
+    Returns: domain, types_queried, results: {TYPE: {status, ttl, records[]}},
+    resolved_via ("doh/google"), and a flat summary {has_A, has_AAAA, has_MX,
+    has_TXT, has_NS}. 400 on a bad domain, 502 if DoH is unreachable.
+    """
+    raw = (request.values.get("domain") or request.values.get("url") or "").strip()
+    if not raw:
+        return jsonify(error="pass ?domain=example.com"), 400
+    # Accept either a bare hostname or a full URL; reduce to the registrable
+    # host. ``urlsplit`` handles "example.com", "https://example.com/x",
+    # "http://user:pass@example.com:8080/p?q=1" uniformly.
+    if "://" in raw:
+        parts = urlsplit(raw)
+        domain = parts.hostname or ""
+    else:
+        # urlsplit gives netloc='example.com:80' for "example.com:80"; we
+        # pull the host port-free. Strip any trailing path/query too.
+        candidate = raw.split("/", 1)[0]
+        # Strip brackets from an [ipv6]:port form just in case.
+        if candidate.startswith("["):
+            end = candidate.find("]")
+            domain = candidate[1:end] if end != -1 else candidate
+        else:
+            domain = candidate.rsplit(":", 1)[0] if candidate.count(":") == 1 else candidate
+    domain = domain.lower().strip(".")
+    if not domain or not re.match(r"^[a-z0-9.\-]+$", domain):
+        return jsonify(error="invalid_domain", domain=raw), 400
+    if len(domain) > 253:
+        return jsonify(error="domain_too_long", max=253, got=len(domain)), 400
+
+    # Parse the requested types; default to the documented set.
+    type_param = (request.values.get("type") or "").strip().upper()
+    if type_param:
+        wanted = [t.strip() for t in type_param.split(",") if t.strip()]
+        wanted = [t for t in wanted if t in _DNS_ALLOWED_TYPES]
+        if not wanted:
+            return jsonify(
+                error="invalid_type",
+                allowed=sorted(_DNS_ALLOWED_TYPES),
+            ), 400
+    else:
+        wanted = list(_DNS_DEFAULT_TYPES)
+
+    results = {}
+    for rtype in wanted:
+        try:
+            results[rtype] = _doh_resolve(domain, rtype)
+        except ValueError as exc:
+            results[rtype] = {"type": rtype, "error": str(exc)}
+    # If every type errored on what looks like a transport failure (none got a
+    # status field), surface a 502 so the caller knows DoH itself was down.
+    any_ok = any("status" in v for v in results.values())
+    out = {
+        "domain": domain,
+        "types_queried": wanted,
+        "results": results,
+        "resolved_via": "doh/google",
+        "summary": {
+            "has_A": bool(results.get("A", {}).get("records")),
+            "has_AAAA": bool(results.get("AAAA", {}).get("records")),
+            "has_MX": bool(results.get("MX", {}).get("records")),
+            "has_TXT": bool(results.get("TXT", {}).get("records")),
+            "has_NS": bool(results.get("NS", {}).get("records")),
+        },
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "dns-lookup:%s" % domain[:150])
+    # 502 only when literally nothing resolved (DoH unreachable),
+    # not when individual types legitimately returned NXDOMAIN (status 3).
+    if not any_ok:
+        out["error"] = "doh_unreachable"
+        return jsonify(out), 502
+    return jsonify(out)
+
+
+# ============================================================================
+# Readability extraction (1.8.5) — pull the main article text from a page
+# ============================================================================
+# Builds on _TextExtractor (visible-text stripper from /api/word-count) but
+# adds real article-detection heuristics:
+#   1. Prefer semantic main containers: <article>, <main>, [role=main],
+#      #main, #content, #post, .post-content, .entry-content, .article-body.
+#   2. Otherwise score block-level <div>/<section> elements by link density
+#      (the classic Readability signal: high-link-density blocks are
+#      boilerplate nav/comments, low-link-density text blocks are content).
+#   3. Extract headings (h1-h3) inside the chosen container as a structured
+#      outline, and the first paragraph as a plain-text excerpt.
+
+_READ_SEMANTIC_RE = re.compile(
+    r"<(article|main)\b[^>]*>(.*?)</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+_READ_ROLE_MAIN_RE = re.compile(
+    r"<(\w+)[^>]*\brole=[\"']main[\"'][^>]*>(.*?)</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+_READ_ID_CLASS_RE = re.compile(
+    r"<(div|section|article)\b[^>]*\b(?:id|class)=[\"'][^\"']*"
+    r"(?:main|content|post|article|entry|story|article-body)[^\"']*[\"'][^>]*>(.*?)</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+# Link density helper: ratio of chars inside <a>…</a> to total text length.
+_READ_A_RE = re.compile(r"<a\b[^>]*>(.*?)</a>", re.IGNORECASE | re.DOTALL)
+_READ_BLOCK_RE = re.compile(
+    r"<(div|section|article|main)\b[^>]*>(.*?)</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+_READ_P_RE = re.compile(r"<p\b[^>]*>(.*?)</p>", re.IGNORECASE | re.DOTALL)
+_READ_TAG_RE = re.compile(r"<[^>]+>")
+_READ_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _readability_strip(html_fragment: str) -> tuple[str, int]:
+    """Strip tags from an HTML fragment and return (text, text_char_len)."""
+    text = _READ_TAG_RE.sub(" ", html_fragment)
+    text = _READ_WHITESPACE_RE.sub(" ", text).strip()
+    return (text, len(text))
+
+
+def _readability_link_density(html_fragment: str) -> float:
+    """Ratio of characters inside <a>…</a> to total visible-text characters.
+
+    A block whose text is mostly anchor text (link density near 1.0) is
+    almost certainly navigation/comment boilerplate, not article body.
+    """
+    stripped, total = _readability_strip(html_fragment)
+    if total == 0:
+        return 1.0  # empty block -> treat as all-links so it scores 0
+    link_chars = 0
+    for m in _READ_A_RE.finditer(html_fragment):
+        lt, _ = _readability_strip(m.group(1))
+        link_chars += len(lt)
+    return link_chars / total if total else 1.0
+
+
+def _extract_readability(html_text: str, base_url: str) -> dict:
+    """Pull the main article text out of an HTML document, heuristically.
+
+    Returns {title, excerpt, text, word_count, char_count, headings[],
+    container_used, method}. ``method`` is "semantic" (matched <article>/
+    <main>/role=main) or "scoring" (block-level density heuristic) so the
+    caller can tell how confident the extraction was.
+    """
+    # Title from head (cheap; reuses the existing parser).
+    head_html = _extract_head(html_text)
+    tp = _PeekParser(base_url)
+    try:
+        tp.feed(head_html)
+    except AssertionError:
+        pass
+    title = _clean(tp.title)
+
+    # ---- Step 1: try semantic main containers (most reliable) -------------
+    candidate_html = ""
+    method = "none"
+    # <article> / <main> are the strongest semantic signals; prefer them
+    # over role/id/class which can be mis-applied. Try <article> first since
+    # it is more specific, then <main>, then role=main.
+    for rx, label in (
+        (_READ_SEMANTIC_RE, "article-or-main"),
+        (_READ_ROLE_MAIN_RE, "role-main"),
+        (_READ_ID_CLASS_RE, "id-class"),
+    ):
+        matches = rx.findall(html_text)
+        if matches:
+            # Pick the longest match (the main article is usually the
+            # largest semantic container on the page).
+            matches.sort(key=lambda mv: len(mv[1]), reverse=True)
+            candidate_html = matches[0][1]
+            method = "semantic:" + label
+            break
+
+    # ---- Step 2: link-density block scoring (Readability-style) ----------
+    # If no semantic container matched, score every top-level <div>/<section>
+    # block. Content score = text_len * (1 - link_density). High-link-density
+    # blocks (nav, related-links, comments) score low even if they are long.
+    if not candidate_html:
+        best_score = -1.0
+        best_html = ""
+        for m in _READ_BLOCK_RE.finditer(html_text):
+            inner = m.group(2)
+            if len(inner) < 200:
+                continue  # too short to plausibly be the article body
+            text, tlen = _readability_strip(inner)
+            if tlen < 200:
+                continue
+            ld = _readability_link_density(inner)
+            # content score: long low-link-density blocks win.
+            score = tlen * (1.0 - ld)
+            if score > best_score:
+                best_score = score
+                best_html = inner
+        if best_html:
+            candidate_html = best_html
+            method = "scoring"
+
+    # ---- Step 3: extract text, headings, and an excerpt ------------------
+    if not candidate_html:
+        # Last resort: fall back to the whole <body> if we have one; this
+        # is the least-confident path so mark it explicitly.
+        body_re = re.compile(r"<body\b[^>]*>(.*?)</body>", re.IGNORECASE | re.DOTALL)
+        bm = body_re.search(html_text)
+        candidate_html = bm.group(1) if bm else html_text
+        method = "fallback:body"
+
+    full_text, char_count = _readability_strip(candidate_html)
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'\-]*", full_text)
+
+    # Headings inside the chosen container -> structured outline (h1-h3).
+    # We only collect headings within the candidate HTML: if the candidate
+    # IS an <article>/<main> its headings are the article's own; if the
+    # candidate was scored from a <div> we still get the section's outline.
+    headings = []
+    h_re = re.compile(r"<(h[1-3])\b[^>]*>(.*?)</\1>", re.IGNORECASE | re.DOTALL)
+    for hm in h_re.finditer(candidate_html):
+        htext, _ = _readability_strip(hm.group(2))
+        htext = _READ_WHITESPACE_RE.sub(" ", htext).strip()
+        if htext:
+            headings.append({"level": int(hm.group(1)[1]), "text": htext[:300]})
+
+    # Excerpt: first non-empty <p> inside the candidate.
+    excerpt = ""
+    for pm in _READ_P_RE.finditer(candidate_html):
+        ptext, plen = _readability_strip(pm.group(1))
+        ptext = _READ_WHITESPACE_RE.sub(" ", ptext).strip()
+        if plen >= 40:
+            excerpt = ptext[:500]
+            break
+    if not excerpt and full_text:
+        excerpt = full_text[:500]
+
+    return {
+        "title": title,
+        "excerpt": excerpt,
+        "text": full_text[:20000],  # cap the returned body to keep payloads sane
+        "text_truncated": len(full_text) > 20000,
+        "full_text_length": len(full_text),
+        "word_count": len(words),
+        "char_count": char_count,
+        "headings": headings[:50],
+        "heading_count": len(headings),
+        "container_used": method,
+    }
+
+
+@app.route("/api/readability")
+@rate_limit(app)
+def api_readability():
+    """Extract the main article text from a page (Readability-style).
+
+    Query: ?url=https://...  (required)
+    Optional: ?max_chars=20000   cap on returned ``text`` (default 20000,
+                                  floor 500, ceiling 100000)
+
+    Uses stdlib HTMLParser heuristics — no readability/jsdom dep:
+      1. Prefer semantic containers (<article>, <main>, role=main,
+         id/class matching main|content|post|article|entry|story).
+      2. Otherwise score block-level <div>/<section> by link density:
+         longest low-link-density block wins (Readability's core signal).
+      3. Fall back to <body> if neither matched.
+
+    Returns: title, excerpt (first paragraph), text (article body, capped),
+    full_text_length, word_count, char_count, headings[] (outline inside
+    the chosen container), container_used (which heuristic matched).
+    502 on fetch failure, 400 on a bad/missing URL.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        # Mirror /api/structured-data's careful split so input-validation
+        # errors land as 400, not masked as 502 fetch_failed.
+        return jsonify(error=str(e)), 400
+    try:
+        max_cap = max(500, min(100000, int(request.values.get("max_chars") or 20000)))
+    except ValueError:
+        max_cap = 20000
+    try:
+        final_url, html_text, _ = _fetch(url)
+    except _FETCH_EXC as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+    out = _extract_readability(html_text, final_url)
+    # Re-apply the per-call max_chars cap (the helper uses a 20000 default;
+    # an explicit cap is honoured here so ?max_chars=100000 works).
+    if len(out["text"]) > max_cap:
+        out["text"] = out["text"][:max_cap]
+        out["text_truncated"] = True
+    out["url"] = final_url
+    out["max_chars"] = max_cap
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "readability:%s" % final_url[:150])
+    return jsonify(out)
+
+
+# ============================================================================
+# OG image generator (1.8.5) — placeholder OpenGraph image from text
+# ============================================================================
+# Many developers need a placeholder og:image for pages without one, or for
+# local/staging/CI builds. This endpoint renders a 1200x630 PNG (the
+# canonical OG image size) from a ?title= (and optional ?subtitle=) using
+# Pillow (PIL), which is already an optional dep of /api/qr. When PIL is not
+# installed the endpoint returns a structured 503, exactly like /api/qr.
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+
+
+def _hex_to_rgb(h: str, default: tuple) -> tuple:
+    """Convert a '#RRGGBB' or 'RRGGBB' string to an (r,g,b) tuple."""
+    v = (h or "").strip().lstrip("#")
+    if not re.match(r"^[0-9a-fA-F]{6}$", v):
+        return default
+    return (int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16))
+
+
+def _load_og_font(size: int):
+    """Best-effort system font; fall back to PIL's default bitmap font.
+
+    We try a curated list of common font paths so the rendering works on
+    most Linux distros without a font install step. If none found, PIL's
+    load_default() is used — it only has one size, so the requested ``size``
+    is ignored in that case (the text still renders, just smaller).
+
+    Returns a PIL ImageFont (FreeTypeFont when a TTF is found, else the
+    built-in bitmap font) — both expose the ``textlength``/``getsize``
+    metrics used by _wrap_text.
+    """
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/usr/local/share/fonts/DejaVuSans-Bold.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except (OSError, IOError):
+            continue
+    # Final fallback: PIL's built-in bitmap font (size is fixed/small).
+    return ImageFont.load_default()
+
+
+def _wrap_text(text: str, font, draw, max_width: int) -> list:
+    """Greedy word-wrap ``text`` to fit ``max_width`` pixels for ``font``.
+
+    Returns a list of lines (str). Tries to break on spaces; one over-long
+    word is allowed to overflow rather than being mid-word-split, which
+    keeps titles readable.
+    """
+    if not text:
+        return []
+    words = text.split()
+    lines = []
+    cur = ""
+    for w in words:
+        trial = (cur + " " + w).strip()
+        try:
+            # PIL >= 9.2: textlength(). Older: textlength() may be absent;
+            # fall back to font.getsize() (deprecated in 10.0 but works).
+            width = draw.textlength(trial, font=font)
+        except (AttributeError, TypeError):
+            try:
+                width = font.getsize(trial)[0]  # type: ignore[attr-defined]
+            except (AttributeError, TypeError):
+                width = len(trial) * (size_guess := 10)
+        if width <= max_width or not cur:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _render_og_image(
+    title: str,
+    subtitle: str = "",
+    bg: tuple = (23, 23, 32),
+    fg: tuple = (245, 245, 250),
+    accent: tuple = (99, 102, 241),
+) -> bytes:
+    """Render a 1200x630 PNG og:image with title + subtitle text.
+
+    Layout: a dark background, a left accent bar, the title word-wrapped and
+    vertically centered, the subtitle below it in a smaller faded weight.
+    Returns the PNG bytes.
+    """
+    W, H = 1200, 630
+    img = Image.new("RGB", (W, H), bg)
+    draw = ImageDraw.Draw(img)
+    # Left accent bar (~20px wide, full height) — a pop of brand colour.
+    draw.rectangle([0, 0, 20, H], fill=accent)
+    # Optional top-right corner square (subtle visual interest).
+    draw.rectangle([W - 90, 0, W, 90], fill=accent)
+
+    # Title font: a large bold size that scales with title length so a
+    # 1-word and a 12-word title both fit inside the safe area.
+    title_size = 96 if len(title) <= 20 else (72 if len(title) <= 60 else 56)
+    title_font = _load_og_font(title_size)
+    subtitle_font = _load_og_font(max(28, title_size // 3))
+
+    # Safe text area (left padding accounts for the accent bar).
+    pad_x = 80
+    safe_w = W - pad_x - 80
+    title_lines = _wrap_text(title, title_font, draw, safe_w)
+    if not title_lines:
+        title_lines = [title or "Untitled"]
+
+    # Compute the stacked height so the block is vertically centered.
+    line_h = int(title_size * 1.18)
+    block_h = len(title_lines) * line_h
+    if subtitle:
+        sub_h = int(max(28, title_size // 3) * 1.4)
+        block_h += sub_h + 32
+    y = max(40, (H - block_h) // 2)
+
+    for line in title_lines:
+        draw.text((pad_x, y), line, font=title_font, fill=fg)
+        y += line_h
+
+    if subtitle:
+        sub_lines = _wrap_text(subtitle, subtitle_font, draw, safe_w)
+        for sline in sub_lines[:3]:  # cap subtitle to 3 lines
+            draw.text((pad_x, y), sline, font=subtitle_font, fill=(170, 170, 190))
+            y += int(max(28, title_size // 3) * 1.25)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+@app.route("/api/og-image")
+@rate_limit(app)
+def api_og_image():
+    """Generate a placeholder OpenGraph image (1200x630 PNG) from text.
+
+    Query:
+      ?title=Your Title            required (1-200 chars); the headline text
+      ?subtitle=Optional subtitle  optional; rendered smaller, below title
+      ?bg=1a1a2e                   optional; hex background colour (no #)
+      ?fg=f5f5fa                   optional; hex foreground/title colour
+      ?accent=6366f1              optional; hex accent-bar colour
+
+    Renders a 1200x630 PNG (the canonical OG image size) with the title
+    word-wrapped and vertically centred, a left brand accent bar, and the
+    optional subtitle beneath the title in a faded weight. Uses Pillow
+    (PIL) — the same optional dep as /api/qr. Returns image/png bytes
+    (so a <meta property=og:image> or <img src> can point at it directly).
+    503 if PIL is not installed, 400 if ?title= is missing/empty.
+    """
+    if not _PIL_AVAILABLE:
+        return jsonify(error="pillow lib not installed"), 503
+    title = (request.values.get("title") or "").strip()
+    if not title:
+        return jsonify(error="pass ?title=Your+Title"), 400
+    if len(title) > 200:
+        return jsonify(error="title_too_long", max=200, got=len(title)), 413
+    subtitle = (request.values.get("subtitle") or "").strip()
+    if len(subtitle) > 300:
+        return jsonify(error="subtitle_too_long", max=300, got=len(subtitle)), 413
+    bg = _hex_to_rgb(request.values.get("bg") or "", (23, 23, 32))
+    fg = _hex_to_rgb(request.values.get("fg") or "", (245, 245, 250))
+    accent = _hex_to_rgb(request.values.get("accent") or "", (99, 102, 241))
+    try:
+        png_bytes = _render_og_image(title, subtitle, bg=bg, fg=fg, accent=accent)
+    except Exception as exc:
+        # Catch any PIL render/save error so the endpoint returns a clean
+        # 503 (matching /api/qr's posture) instead of a bare 500.
+        return jsonify(error="og_image_render_failed", detail=str(exc)[:200]), 503
+    record_billing(g.meter_key, g.plan, "og-image:%s" % title[:150])
+    return Response(
+        png_bytes,
+        mimetype="image/png",
+        headers={
+            "Cache-Control": "public, max-age=86400",
+            "X-LinkPeek-Generated": "true",
+        },
+    )
+
+
 @app.route("/api/status")
 def api_status():
     """Self-describing service manifest (1.2.0): version, uptime, and the
     full list of registered API routes with their methods. Useful for SDK
     clients and for a landing-page client to render an endpoint catalogue
     dynamically.
+    New in 1.8.5: /api/dns-lookup (DoH-based A/AAAA/CNAME/MX/TXT/NS resolver),
+    /api/readability (extract main article text via Readability-style
+    link-density heuristics, stdlib only), /api/og-image (generate a
+    placeholder 1200x630 OG image PNG from ?title=+?subtitle= via Pillow).
     New in 1.8.4: /api/content-type (headers-only fetch -> content_type,
     charset, server, last_modified, status_code), /api/ssl-info (TLS cert
     issuer/subject/expiry + protocol + cipher for an https URL).
-    35 registered endpoints total.
+    Registered endpoints total: see the ``endpoints`` array length in this
+    response (38 as of 1.8.5; the count is computed dynamically from the
+    Flask url_map so it never drifts from the actual route table).
     New in 1.7.1: /api/sitemap-parse (parses sitemap.xml URL → URLs+sub-sitemaps),
     /api/og-image-proxy (proxies the og:image bytes for a page, with a byte cap),
     decorators.py type-annotation corruption fix (``***`` -> ``str``).
@@ -2783,6 +3390,235 @@ def api_health():
             "pay_method": pay_method,  # live when "stripe" or "paypal"
             "subscribe_url": "/api/subscribe?email=…",
         },
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# PayPal IPN / webhook endpoint — auto-activates paid Pro accounts.
+#
+# Receives a PayPal webhook/Instant Payment Notification event, extracts the
+# payer email + gross amount, finds matching keys in keys.json, and flips
+# paid=true + plan="pro" when payment_status == COMPLETED and amount >= $5.00.
+#
+# Accepts both JSON (PayPal REST webhooks) and form-encoded (classic IPN).
+# Does NOT verify PayPal's HMAC/IPN signature (we have no PayPal Partner
+# credentials or NowPayments API key set yet) — once a key is set, a future
+# wake can verify the payload. Cheap, defensive: the endpoint is harmless to
+# random SPAM (no key matches → 404, no state change).
+# ──────────────────────────────────────────────────────────────────────────
+@app.route("/api/webhook/paypal", methods=["POST"])
+def api_webhook_paypal():
+    import time as _time
+    from decorators import PRO_PRICE_USD as PRO_PRICE
+
+    # ── Parse payload ────────────────────────────────────────────
+    payload = None
+    if request.is_json:
+        payload = request.get_json(silent=True) or {}
+    elif request.method == "POST":
+        payload = request.form.to_dict() or {}
+    else:
+        payload = {}
+    if not payload:
+        return jsonify(ok=False, error="empty_or_unsupported_payload"), 400
+
+    # PayPal REST webhooks put fields under .resource; classic IPN is flat.
+    resource = payload.get("resource") if isinstance(payload, dict) else None
+    if isinstance(resource, str):
+        try:
+            resource = json.loads(resource)
+        except Exception:
+            resource = {}
+    if not isinstance(resource, dict):
+        resource = {}
+
+    # Extract email from various possible shapes.
+    payer_email = (
+        (resource.get("payer") or {}).get("email_address")
+        or (resource.get("payer_info") or {}).get("email_address")
+        or (payload.get("payer") or {}).get("email_address")
+        or (payload.get("payer_info") or {}).get("email_address")
+        or payload.get("payer_email")
+        or payload.get("email")
+        or (resource.get("payer") or {}).get("email")
+        or (payload.get("payer") or {}).get("email")
+    )
+    if not payer_email or not isinstance(payer_email, str):
+        return jsonify(ok=False, error="no_payer_email"), 400
+    payer_email = payer_email.strip().lower()
+    if "@" not in payer_email:
+        return jsonify(ok=False, error="invalid_payer_email"), 400
+
+    # Extract payment status + amount.
+    payment_status = (
+        payload.get("payment_status")
+        or resource.get("status")
+        or payload.get("status")
+        or ""
+    )
+    if isinstance(payment_status, str):
+        payment_status = payment_status.upper()
+    else:
+        payment_status = ""
+
+    amount_str = (
+        payload.get("mc_gross")
+        or payload.get("payment_gross")
+        or resource.get("amount", {}).get("value")
+        or payload.get("amount", {}).get("value")
+        or "0"
+    )
+    try:
+        amount = float(amount_str)
+    except (TypeError, ValueError):
+        amount = 0.0
+
+    # ── Load keys + update paid status ───────────────────────────
+    keys = _load_keys()
+    activated = []
+    no_change = []
+    for ap_key, meta in keys.items():
+        if not isinstance(meta, dict):
+            continue
+        key_email = (meta.get("email") or "").strip().lower()
+        if key_email != payer_email:
+            continue
+        # Already paid → mark no_change and move on.
+        if meta.get("plan") == "pro" and meta.get("paid"):
+            no_change.append({"key": ap_key, "reason": "already_pro_paid"})
+            continue
+        # Non-completed payment or below threshold → mark but don't upgrade.
+        if payment_status != "COMPLETED":
+            no_change.append({"key": ap_key,
+                              "reason": "payment_not_completed_" + payment_status})
+            continue
+        if amount < (PRO_PRICE or 5.0):
+            no_change.append({"key": ap_key,
+                              "reason": "amount_below_threshold_" + str(amount)})
+            continue
+        # Upgrade: flip paid + pro, stamp audit trail.
+        meta["plan"] = "pro"
+        meta["paid"] = True
+        meta["auto_activated"] = _time.time()
+        meta["activation_source"] = "paypal_webhook"
+        meta["activation_amount_usd"] = amount
+        keys[ap_key] = meta
+        activated.append({"key": ap_key, "amount_usd": amount,
+                          "previous_plan": meta.get("plan", "?")})
+
+    if activated:
+        _save_keys(keys)
+        record_billing("paypal", "pro_activated", "paypal_webhook:" + payer_email[:150])
+
+    # 200 OK either way so PayPal stops retrying (we handle via state).
+    try:
+        return jsonify(
+            ok=True,
+            payer_email=payer_email,
+            amount_usd=amount,
+            status=payment_status,
+            keys_activated=[a["key"] for a in activated],
+            keys_no_change=no_change,
+        ), 200 if (activated or no_change) else 404
+    except Exception:
+        return jsonify(
+            ok=True, payer_email=payer_email,
+            keys_activated=[a["key"] for a in activated],
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# /api/broken-links — fetch a page, extract all URLs from it, HEAD-request
+# each one, report which return 4xx/5xx or timeout. SEO maintenance use case:
+# blog/CMS maintainers check pages for broken links. Reuses existing plumbing
+# (_fetch, _normalize_url, urljoin). Cap at 20 links with 4s HEAD timeout each.
+# ──────────────────────────────────────────────────────────────────────────
+@app.route("/api/broken-links")
+@rate_limit(app)
+def api_broken_links():
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="missing url parameter"), 400
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+
+    limit = max(1, min(20, int(request.values.get("limit") or 10)))
+    head_timeout = max(1, min(8, int(request.values.get("timeout") or 4)))
+
+    # ── Fetch source page via existing _fetch ──────────────────────
+    try:
+        final_url, html_text, headers = _fetch(url, timeout=10)
+    except _FETCH_EXC as e:
+        return jsonify(error="fetch_failed", detail=str(e)), 502
+
+    content_type = (headers.get("Content-Type") or "").lower()
+    if not (content_type.startswith("text/html") or content_type.startswith("application/xhtml")):
+        return jsonify(error="source is not HTML (got %s)" % content_type), 422
+
+    # Extract all href="..." links — regex (stdlib only, no BeautifulSoup).
+    href_re = re.compile(r"""(?:href|src)\s*=\s*["']([^"']+)["']""", re.I)
+    raw_links = href_re.findall(html_text)[:limit * 2]
+
+    # Normalize relative + dedupe + cap.
+    seen = set()
+    links = []
+    for l in raw_links:
+        full = urljoin(final_url, l)
+        if full.startswith(("http://", "https://")) and full not in seen:
+            seen.add(full)
+            links.append(full)
+            if len(links) >= limit:
+                break
+
+    if not links:
+        return jsonify(broken_links=[], broken_count=0, checked_count=0,
+                       quota=quota_echo(g))
+
+    # ── Parallel HEAD checks ─────────────────────────────────────
+    _UA = "Mozilla/5.0 (compatible; LinkPeek/1.0; +https://github.com/linkpeek)"
+    def _check(lk):
+        try:
+            opener = build_opener(ProxyHandler())
+            req = Request(lk, method="HEAD",
+                          headers={"User-Agent": _UA})
+            resp = opener.open(req, timeout=head_timeout)
+            status = resp.status
+            resp.close()
+            return {"url": lk, "status": status, "broken": status >= 400}
+        except HTTPError as e:
+            return {"url": lk, "status": e.code,
+                    "broken": e.code >= 400, "error": e.reason}
+        except _FETCH_EXC as e:
+            return {"url": lk, "status": None, "broken": True,
+                    "error": str(e)[:100]}
+
+    results = []
+    broken = []
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        for r in pool.map(_check, links):
+            results.append({
+                "url": r["url"], "status": r.get("status"),
+                "broken": r.get("broken", False),
+                "error": r.get("error"),
+            })
+            if r.get("broken"):
+                broken.append(r["url"])
+
+    # Source netloc for billing label (parts is local to _normalize_url).
+    try:
+        src_netloc = urlsplit(url).netloc[:150]
+    except Exception:
+        src_netloc = ""
+    record_billing(g.meter_key, g.plan, "broken-links:%s" % src_netloc)
+    return jsonify(
+        source=url,
+        checked_count=len(results),
+        broken_count=len(broken),
+        broken_links=broken,
+        results=results,
+        quota=quota_echo(g),
     )
 
 

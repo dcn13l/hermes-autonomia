@@ -1149,9 +1149,32 @@ def _parse_feed(xml_text: str, base_url: str = "") -> dict:
     if not is_atom and not is_rss:
         raise ValueError("not a recognized feed root (<rss> or <feed>): got <%s>" % root_local)
 
+    # Atom feeds almost always declare a default namespace
+    # (xmlns="http://www.w3.org/2005/Atom"). ElementTree's bare-name lookups
+    # (root.find("entry"), elem.find("title")) do NOT match elements that live
+    # in a default namespace — they silently return None / []. This made every
+    # real-world Atom feed (Verge, GitHub releases, most blogs) parse to an
+    # empty feed: title="", item_count=0. Fix: extract the default namespace
+    # URI from root.tag ("{uri}feed") and use a prefixed namespace map for the
+    # Atom branch. RSS 2.0 has no default namespace and is left untouched.
+    #
+    # IMPORTANT: element.find("d:title") alone is a *literal tag* match — the
+    # prefix is only resolved when the `namespaces` kwarg is also passed. So we
+    # funnel every find/findall through _f / _fa which always pass _ns along.
+    _ns = {}
+    if is_atom and root.tag[0] == "{":
+        _uri = root.tag[1 : root.tag.find("}")]
+        _ns = {"d": _uri}  # "d" for default-namespace
+
+    def _f(elem, tag):
+        return elem.find("d:" + tag if _ns else tag, _ns if _ns else None)
+
+    def _fa(elem, tag):
+        return elem.findall("d:" + tag if _ns else tag, _ns if _ns else None)
+
     def _text(elem, *names):
         for n in names:
-            child = elem.find(n)
+            child = _f(elem, n)
             if child is not None and child.text:
                 return child.text.strip()
         return ""
@@ -1183,7 +1206,7 @@ def _parse_feed(xml_text: str, base_url: str = "") -> dict:
         feed_info["title"] = _text(root, "title")
         # Atom <link> can have rel/type attributes; prefer rel="alternate"
         link_val = ""
-        for link_elem in root.findall("link"):
+        for link_elem in _fa(root, "link"):
             rel = (link_elem.get("rel") or "alternate").lower()
             href = link_elem.get("href") or ""
             if rel == "alternate" and href:
@@ -1194,9 +1217,9 @@ def _parse_feed(xml_text: str, base_url: str = "") -> dict:
         feed_info["link"] = urljoin(base_url, link_val) if link_val else ""
         feed_info["description"] = _text(root, "subtitle", "tagline")
         feed_info["type"] = "atom"
-        for entry in root.findall("entry"):
+        for entry in _fa(root, "entry"):
             it_link = ""
-            for link_elem in entry.findall("link"):
+            for link_elem in _fa(entry, "link"):
                 rel = (link_elem.get("rel") or "alternate").lower()
                 href = link_elem.get("href") or ""
                 if rel == "alternate" and href:

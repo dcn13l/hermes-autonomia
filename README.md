@@ -1,4 +1,75 @@
-# LinkPeek — autonomous-business revenue product
+# LinkPeek — Free Link Preview & QR Code API
+
+[![Live API](https://img.shields.io/badge/API-live-brightgreen)](http://147.15.103.217.sslip.io:5000/api/health)
+[![License: MIT](https://img.shields.io/github/license/dcn13l/hermes-autonomia)](LICENSE)
+[![Free Tier](https://img.shields.io/badge/free%20tier-100%20req%2Fday-blue)](#pricing)
+[![No Signup](https://img.shields.io/badge/auth-none%20required-success)](#quickstart)
+
+> Drop in any URL → get back `{title, description, og:image, favicon, site_name}` as clean JSON. Generate QR codes instantly. No signup, no API key needed for the free tier.
+
+## Quickstart (no signup)
+
+```bash
+# Link preview JSON
+curl "http://147.15.103.217.sslip.io:5000/api/preview?url=https://github.com"
+# → {"title":"GitHub · Change is constant...", "description":"...", "image":"...", "favicon":"...", "site_name":"GitHub"}
+
+# QR code (PNG)
+curl "http://147.15.103.217.sslip.io:5000/api/qr?text=hello&size=300" -o qr.png
+
+# Discover all endpoints
+curl "http://147.15.103.217.sslip.io:5000/api/status"
+```
+
+Live now — try it in your terminal.
+
+## Why LinkPeek?
+
+Every link-preview / OG-metadata service out there is either paid-only, rate-limited to the point of uselessness, or randomly shuts down after a few months. LinkPeek is **open-source**, **self-hostable**, and **doesn't require sign-up** for the free tier — just make the call.
+
+Built for: Discord/Telegram bot developers, link preview cards, social sharing, OAuth integrations, web scrapers, QR code apps. If you need link metadata, this is the simplest API that returns it.
+
+## Pricing
+
+| Plan  | Daily limit    | Auth           | How to get                               |
+|-------|----------------|----------------|------------------------------------------|
+| **Free**  | 100 / day   | none (per-IP)  | just call `/api/preview?url=…` — no key, no signup |
+| **Pro**   | 50,000 / day | API key        | `GET /api/subscribe?email=you@mail.com`  |
+| **Trial** | 50,000 / day | API key        | `GET /api/key?email=you@mail.com` (14d free)  |
+
+The free tier has **no API key and no signup** — just hit the endpoint.
+
+## All 32 endpoints (37 routes)
+
+<details><summary><b>Click to see all endpoints</b></summary>
+
+- `GET /api/preview?url=` — link preview JSON (title/description/og:image/favicon)
+- `GET /api/qr?text=` — QR code PNG (configurable size, ECC levels)
+- `GET /api/extract?url=` — raw meta + links + headings (deeper crawl)
+- `GET /api/metadata-full?url=` — full metadata dump (every meta tag)
+- `GET /api/batch?urls=` — up to 5 URLs at once (parallel fetch)
+- `GET /api/diff?url1=&url2=` — compare two URLs' metadata
+- `GET /api/favicons?url=` — proxy favicon image bytes
+- `GET /api/robots?url=` — parse robots.txt as JSON
+- `GET /api/headers?url=` — HTTP response headers only
+- `GET /api/oembed?url=` — oEmbed 1.0 "link" provider JSON
+- `GET /api/shortlink?url=` — create/resolve base62 short links
+- `GET /lp/<code>` — 302 redirect for a short code
+- `GET /api/screenshot-url-hint?url=` — suggestion for screenshot service URL
+- `GET /api/opengraph?url=` — OpenGraph-only metadata extraction
+- `GET /api/sitemap-parse?url=` — parse XML sitemaps (up to 500 URLs)
+- `GET /api/og-image-proxy?url=` — fetch og:image bytes (solves CORS for Discord/Slack)
+- `GET /api/validate-key?key=` — validate an API key
+- `GET /api/status` — version + endpoint listing (discovery, unmetered)
+- `GET /api/rss?url=` — RSS/Atom feed detection + parsing
+- `GET /api/word-count?url=` — content stats: word count, reading time, top terms
+- `GET /api/health` — `{ok, today:{day, count}}`
+- `GET /api/key?email=` — issue a 14-day **trial** API key
+- `GET /api/subscribe?email=` — mint a **Pro** API key + get a self-serve payment link
+
+</details>
+
+## Operational notes
 
 Flask app. Two tiers (matches `decorators.py`):
 

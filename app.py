@@ -88,7 +88,7 @@ _FETCH_EXC = (
 )
 
 # Service metadata for /api/status
-__version__ = "1.8.1"
+__version__ = "1.8.2"
 _START_TIME = time.time()
 
 
@@ -450,21 +450,79 @@ try:
                 return default
             return "#" + v.lower()
         # make_image() lazily imports PIL; qrcode can be installed without
-        # Pillow, and that ImportError surfaces at request time (escapes the
-        # module-level try/except) turning the endpoint into a 500. Catch it
-        # here so the caller gets a structured 503 instead.
+        # Pillow, and an ImportError at request time escapes the module-level
+        # try/except, turning the endpoint into a 500. Catch ImportError AND
+        # Exception (e.g. Image.DecompressionBombError, OSError on save) so the
+        # caller always gets a structured 503 instead of a bare 500.
         try:
             img = qr.make_image(fill_color=_hexcol("fg", "black"),
                                 back_color=_hexcol("bg", "white"))
             buf = BytesIO()
             img.save(buf, format="PNG")
             buf.seek(0)
-        except ImportError:
-            return jsonify(error="Pillow (PIL) not installed; cannot render PNG"), 503
+        except Exception as exc:
+            return jsonify(error="qr_render_failed", detail=str(exc)[:200]), 503
         return Response(buf.getvalue(), mimetype="image/png")
+
+    @app.route("/api/qrcode")
+    @rate_limit(app)
+    def api_qrcode_json():
+        """QR code as base64-encoded PNG inside a JSON envelope.
+
+        Query: ?text=... (required)  ?ecc=l|m|q|h  ?fg=RRGGBB  ?bg=RRGGBB
+        Returns: {ok, text, image: "data:image/png;base64,...", ecc, size_bytes}
+        Useful for clients that cannot consume raw binary image responses
+        (e.g. JSON-only webhook consumers, serverless function return values).
+        """
+        import base64
+        text = (request.values.get("text") or "").strip()
+        if not text:
+            return jsonify(error="pass ?text=..."), 400
+        _QR_MAX_CHARS = 2000
+        if len(text) > _QR_MAX_CHARS:
+            return jsonify(error="text_too_long", max=_QR_MAX_CHARS, got=len(text)), 413
+        _ECC = {"l": qrcode.constants.ERROR_CORRECT_L,
+                "m": qrcode.constants.ERROR_CORRECT_M,
+                "q": qrcode.constants.ERROR_CORRECT_Q,
+                "h": qrcode.constants.ERROR_CORRECT_H}
+        ecc_name = (request.values.get("ecc") or "m").strip().lower()
+        ecc = _ECC.get(ecc_name, qrcode.constants.ERROR_CORRECT_M)
+        qr = qrcode.QRCode(version=None, error_correction=ecc,
+                           box_size=10, border=2)
+        qr.add_data(text)
+        qr.make(fit=True)
+
+        def _hexcol(name, default):
+            v = (request.values.get(name) or "").strip().lstrip("#")
+            if not v or not re.match(r"^[0-9a-fA-F]{6}$", v):
+                return default
+            return "#" + v.lower()
+        try:
+            img = qr.make_image(fill_color=_hexcol("fg", "black"),
+                                back_color=_hexcol("bg", "white"))
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            data = buf.getvalue()
+        except Exception as exc:
+            return jsonify(error="qr_render_failed", detail=str(exc)[:200]), 503
+        b64 = base64.b64encode(data).decode("ascii")
+        out = {
+            "ok": True,
+            "text": text,
+            "ecc": ecc_name,
+            "size_bytes": len(data),
+            "image": "data:image/png;base64," + b64,
+        }
+        out["quota"] = quota_echo(g)
+        record_billing(g.meter_key, g.plan, "qrcode:%s" % text[:150])
+        return jsonify(out)
 except ImportError:
     @app.route("/api/qr")
     def api_qr_unavailable():
+        return jsonify(error="qrcode lib not installed"), 503
+
+    @app.route("/api/qrcode")
+    def api_qrcode_json_unavailable():
         return jsonify(error="qrcode lib not installed"), 503
 
 
@@ -2306,6 +2364,70 @@ def api_status():
         pro_daily_limit=50000,
         docs="/api/status",
         health="/api/health",
+    )
+
+
+@app.route("/api/health/json")
+def api_health_json():
+    """Machine-friendly health with no human-readable adapters.
+
+    Fixed-structure Alternative to /api/health that omits currency symbols
+    and subscribe_url adapters, for clients that just want numbers.
+    Returns: ok, version, uptime_seconds, today: {day, count},
+    now_iso (UTC, ISO 8601), free_daily_limit, pro_daily_limit.
+    """
+    import datetime
+    routes = sorted(
+        r.rule for r in app.url_map.iter_rules()
+        if r.rule.startswith("/api/") and r.rule != "/api/health/json"
+    )
+    return jsonify(
+        ok=True,
+        service="LinkPeek",
+        version=__version__,
+        uptime_seconds=round(time.time() - _START_TIME, 1),
+        today=daily_totals(),
+        now_iso=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        free_daily_limit=100,
+        pro_daily_limit=50000,
+        endpoint_count=len(routes),
+    )
+
+
+@app.route("/api/stats")
+def api_stats():
+    """Live usage + route inventory.
+
+    Returns: uptime_seconds, todays_request_count, free_daily_limit,
+    pro_daily_limit, total_endpoints, top_endpoints (sorted route list with
+    allowed methods), and service version. Useful for dashboards and
+    monitoring (e.g. Uptime Kuma custom-push or Prometheus scrape via shell).
+    """
+    endpoints = sorted(
+        (
+            {
+                "path": r.rule,
+                "methods": sorted(m for m in r.methods if m in {"GET", "POST", "PUT", "DELETE"}),
+            }
+            for r in app.url_map.iter_rules()
+            if r.rule.startswith("/api/")
+        ),
+        key=lambda e: e["path"],
+    )
+    today = daily_totals() or {}
+    from decorators import PRO_PRICE_USD
+    return jsonify(
+        ok=True,
+        service="LinkPeek",
+        version=__version__,
+        uptime_seconds=round(time.time() - _START_TIME, 1),
+        todays_request_count=today.get("count", 0),
+        today_day=today.get("day", ""),
+        free_daily_limit=100,
+        pro_daily_limit=50000,
+        pro_price_usd=PRO_PRICE_USD,
+        total_endpoints=len(endpoints),
+        endpoints=endpoints,
     )
 
 

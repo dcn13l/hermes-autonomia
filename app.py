@@ -26,6 +26,7 @@ Single Flask app. Endpoints:
     GET  /api/pdf-info         extract PDF metadata (version, page count, title…)
     GET  /api/sitemap-parse    parse a sitemap.xml URL into {urls:[…], sitemaps:[…]}
     GET  /api/og-image-proxy   fetch + proxy an og:image/the twitter:image bytes
+    GET  /api/redirect-chain   follow a URL's HTTP redirects, report every hop
     GET  /lp/<code>            302-redirect for a short code
 """
 
@@ -88,7 +89,7 @@ _FETCH_EXC = (
 )
 
 # Service metadata for /api/status
-__version__ = "1.8.2"
+__version__ = "1.8.3"
 _START_TIME = time.time()
 
 
@@ -597,10 +598,21 @@ def api_metadata_full():
         parser.feed(head_html)
     except AssertionError:
         pass
+    # Apply the same favicon fallback /api/preview uses so callers don't get
+    # a bare "data:," empty data URI when a site uses <link rel=icon href="data:,">
+    # or omits the tag entirely. Without this, the upstream raw value leaked
+    # straight through and broke favicon consumers expecting a real URL.
+    favicon = parser.favicon or ""
+    if not favicon or favicon.startswith("data:"):
+        parts = urlsplit(final_url)
+        if parts.scheme and parts.netloc:
+            favicon = "{}://{}/favicon.ico".format(parts.scheme, parts.netloc)
+    raw_favicon = parser.favicon or ""
     out = {
         "url": final_url,
         "title": _clean(parser.title),
-        "favicon": parser.favicon,
+        "favicon": favicon,
+        "raw_favicon": raw_favicon,
         "meta": parser.meta,
         "response_headers": dict(headers),
         "head_html_length": len(head_html),
@@ -622,6 +634,119 @@ def api_screenshot_hint():
         return jsonify(error=str(e)), 400
     out["quota"] = quota_echo(g)
     record_billing(g.meter_key, g.plan, url[:200])
+    return jsonify(out)
+
+
+@app.route("/api/redirect-chain")
+@rate_limit(app)
+def api_redirect_chain():
+    """Follow a URL through its HTTP redirect chain and report every hop.
+
+    Query: ?url=https://...  (required)
+    Optional: ?max_hops=10   (default 10, hard ceiling 20 — prevents infinite loops)
+    Optional: ?fetch_body=0  (default 0/HEAD-only; set to 1 to GET and parse
+                              the final destination as a /api/preview link card)
+    Returns the ordered list of redirects:
+
+        chain: [{step, url, status, location}, ...]
+        final_url: final destination
+        redirect_count: number of hops
+        redirect_loop: true if the chain revisited a URL
+        fetch_body=1 modes also include: {title, description, image, ...}
+
+    Useful to debug canonical URLs, detect redirect loops, audit SEO 301
+    chains, and verify affiliate/sanitizer links land where expected.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    try:
+        max_hops = max(1, min(20, int(request.values.get("max_hops") or 10)))
+    except ValueError:
+        max_hops = 10
+    want_body = (request.values.get("fetch_body") or "0").strip() in ("1", "true", "yes")
+
+    # Manual redirect walking: opener.open follows chains by default, so we
+    # use a custom HTTPRequestHandler that returns on each 3xx. Simplest
+    # approach: build_opener with our own HTTPDefaultRedirectHandler that we
+    # disable, then inspect r.url/status after each resp. urllib doesn't expose
+    # the chain though, so we walk it one hop at a time using http.client.
+    chain = []
+    seen = set()
+    current = url
+    redirect_loop = False
+    final_url = url
+    final_status = 0
+    hops = 0
+    opener = build_opener(ProxyHandler())
+    opener.addheaders = [
+        ("User-Agent", "Mozilla/5.0 (compatible; LinkPeek/1.0; +https://github.com/linkpeek)"),
+        ("Accept", "text/html,application/xhtml+xml,*/*;q=0.8"),
+        ("Accept-Language", "en-US,en;q=0.9"),
+        ("Accept-Encoding", "gzip, deflate"),
+    ]
+    # We override the redirect handler with a no-op so we can trace each hop.
+    from urllib.request import HTTPRedirectHandler, Request as _Req
+    class _NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None  # signal caller to handle the redirect manually
+    trace_opener = build_opener(ProxyHandler(), _NoRedirect)
+    trace_opener.addheaders = opener.addheaders
+    for step in range(max_hops + 1):
+        if current in seen:
+            redirect_loop = True
+            break
+        seen.add(current)
+        req = _Req(current, method="GET")
+        try:
+            resp = trace_opener.open(req, timeout=8.0)
+            # Drain a single byte so headers are materialized.
+            resp.read(1)
+            final_url = resp.geturl()
+            final_status = resp.getcode() or 200
+            chain.append({"step": step, "url": current, "status": final_status, "location": ""})
+            break  # 2xx: we've reached the final destination.
+        except HTTPError as e:
+            status = e.code
+            loc = e.headers.get("Location") or ""
+            final_url = current
+            final_status = status
+            if 300 <= status < 400 and loc:
+                next_url = urljoin(current, loc)
+                chain.append({"step": step, "url": current, "status": status, "location": next_url})
+                current = next_url
+                hops += 1
+                continue
+            # non-redirect error: stop and record what we got.
+            chain.append({"step": step, "url": current, "status": status, "location": ""})
+            break
+        except _FETCH_EXC as e:
+            return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+
+    out = {
+        "start_url": url,
+        "final_url": final_url,
+        "final_status": final_status,
+        "redirect_count": hops,
+        "redirect_loop": redirect_loop,
+        "chain": chain,
+    }
+
+    if want_body and not redirect_loop and 200 <= final_status < 300 and final_url:
+        try:
+            preview = preview_link(final_url)
+            for k in ("title", "description", "image", "site_name", "favicon"):
+                if preview.get(k):
+                    out[k] = preview[k]
+        except _FETCH_EXC:
+            pass  # body fetch is best-effort; chain is the primary payload.
+
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "redirect-chain:%s" % url[:200])
     return jsonify(out)
 
 

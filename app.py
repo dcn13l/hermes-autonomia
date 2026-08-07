@@ -527,6 +527,9 @@ def api_metadata_full():
         return jsonify(error="pass ?url=https://..."), 400
     try:
         url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    try:
         final_url, html_text, headers = _fetch(url)
     except _FETCH_EXC as e:
         return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502

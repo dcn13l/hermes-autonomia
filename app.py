@@ -88,7 +88,7 @@ _FETCH_EXC = (
 )
 
 # Service metadata for /api/status
-__version__ = "1.8.0"
+__version__ = "1.8.1"
 _START_TIME = time.time()
 
 

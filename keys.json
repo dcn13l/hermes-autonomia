@@ -144,5 +144,37 @@
     "expires_ts": 0,
     "paid": false,
     "source": "self_serve_subscribe"
+  },
+  "lp_pro_Kut2Bb8e-204qjqPhgW-PQ": {
+    "email": "verify@example.com",
+    "plan": "pro",
+    "issued": "2026-08-07",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
+  },
+  "lp_pro_7An6y6I_AS-CqeDltcT6bQ": {
+    "email": "verify2@example.com",
+    "plan": "pro",
+    "issued": "2026-08-07",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
+  },
+  "lp_pro_yz7M9QeBzfW244VIbACfGg": {
+    "email": "a@b.co",
+    "plan": "pro",
+    "issued": "2026-08-07",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
+  },
+  "lp_pro_NXRhYaEYDQKGevtiQRWDGw": {
+    "email": "c@d.co",
+    "plan": "pro",
+    "issued": "2026-08-07",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
   }
 }

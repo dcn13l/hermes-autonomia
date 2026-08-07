@@ -4,8 +4,16 @@
 [![License: MIT](https://img.shields.io/github/license/dcn13l/hermes-autonomia)](LICENSE)
 [![Free Tier](https://img.shields.io/badge/free%20tier-100%20req%2Fday-blue)](#pricing)
 [![No Signup](https://img.shields.io/badge/auth-none%20required-success)](#quickstart)
+[![Discussions](https://img.shields.io/badge/discussions-join-58a6ff)](https://github.com/dcn13l/hermes-autonomia/discussions)
 
-> Drop in any URL → get back `{title, description, og:image, favicon, site_name}` as clean JSON. Generate QR codes instantly. No signup, no API key needed for the free tier.
+> **LinkPeek turns any URL into a clean JSON link-preview card and any string into a QR code.** Built for Discord/Telegram/Slack bots, bookmark apps, social clients, and anyone who needs link metadata without the signup friction. Open-source, self-hostable, free tier with no API key — just `curl` it. See what you can build in [60 seconds](https://github.com/dcn13l/hermes-autonomia/discussions/5).
+
+**Try it now — paste this in your terminal:**
+
+```bash
+curl "http://147.15.103.217.sslip.io:5000/api/preview?url=https://github.com"
+# {"title":"GitHub · Change is constant...", "description":"...", "image":"...", "favicon":"...", "site_name":"GitHub"}
+```
 
 ## Quickstart (no signup)
 

@@ -3622,6 +3622,153 @@ def api_broken_links():
     )
 
 
+# ============================================================================
+# /api/email-validate — RFC 5322 syntax check + MX record lookup.
+# Provides deliverability info without sending mail. Reuses the stdlib DoH
+# resolver (_doh_resolve) so no third-party DNS library is required.
+# ============================================================================
+# Pragmatic RFC 5322 subset (no obsolete folding, no quoted local parts with
+# escapes — covers virtually every real-world address).  Rejects IPs, quoted
+# pairs, and the "comment" forms; we deliberately never green-light those.
+_EMAIL_RE = re.compile(
+    r"^[A-Z0-9](?:[A-Z0-9._+-]*[A-Z0-9])?"
+    r"@(?:[A-Z0-9](?:[A-Z0-9-]*[A-Z0-9])?\.)+[A-Z]{2,}$",
+    re.IGNORECASE,
+)
+
+
+@app.route("/api/email-validate")
+@app.route("/api/emaill-validate")  # tolerate the documented typo
+@rate_limit(app)
+def api_email_validate():
+    """Validate one email address for syntax (RFC 5322 subset) + MX records.
+
+    Query: ?email=user@example.com  (required)
+    Optional: ?timeout=6            DoH query timeout in seconds (1..15)
+
+    Returns: email, valid_syntax (bool), mx_records: [...], has_mx (bool),
+    domain, plus the DoH status/ttl for the MX query. 400 on a missing email,
+    502 only if the DoH resolver itself is unreachable (the address is still
+    reported with valid_syntax; we just cannot claim deliverability).
+    """
+    email = (request.values.get("email") or "").strip()
+    if not email:
+        return jsonify(error="pass ?email=user@example.com"), 400
+    timeout = max(1, min(15, int(request.values.get("timeout") or 6)))
+
+    valid_syntax = bool(_EMAIL_RE.match(email))
+    domain = ""
+    if "@" in email:
+        domain = email.rsplit("@", 1)[1].lower()
+
+    out = {
+        "email": email,
+        "valid_syntax": valid_syntax,
+        "domain": domain,
+        "has_mx": False,
+        "mx_records": [],
+    }
+    if valid_syntax and domain:
+        try:
+            res = _doh_resolve(domain, "MX", timeout=timeout)
+            out["mx_records"] = res.get("records", [])
+            out["mx_status"] = res.get("status")
+            out["mx_ttl"] = res.get("ttl", 0)
+            out["has_mx"] = bool(out["mx_records"])
+            # DoH returns MX as "priority host" e.g. "10 mail.example.com.";
+            # surface a parsed view too so callers don't have to split.
+            parsed = []
+            for rec in out["mx_records"]:
+                parts = rec.split(None, 1)
+                if len(parts) == 2 and parts[0].isdigit():
+                    parsed.append({"priority": int(parts[0]),
+                                   "host": parts[1].rstrip(".")})
+                else:
+                    parsed.append({"priority": None,
+                                   "host": rec.rstrip(".")})
+            out["mx_parsed"] = parsed
+        except ValueError:
+            # DoH unreachable — still return the syntax verdict.
+            out["mx_error"] = "dns_lookup_failed"
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "email-validate:%s" % domain[:150])
+    return jsonify(out)
+
+
+# ============================================================================
+# /api/screenshot — actually fetch a screenshot PNG via a third-party
+# headless-browser service (microlink.io free tier).  Unlike the existing
+# /api/screenshot-url-hint (which only RETURNs suggested URLs for the caller
+# to hit), this endpoint performs the outbound fetch and streams the image
+# bytes back, so a client that can only call LinkPeek gets a screenshot.
+# Stdlib-only: no headless browser, no Pillow.  Falls back to a 502 + the
+# hint payload on any upstream failure so the caller still gets a path.
+# ============================================================================
+@app.route("/api/screenshot")
+@rate_limit(app)
+def api_screenshot():
+    """Render a screenshot PNG for ?url= via a public screenshot service.
+
+    Query: ?url=https://...               required, target page
+    Optional: ?width=1200                 target viewport width (passed to service)
+    Optional: ?timeout=15                 upstream fetch timeout, seconds (5..30)
+
+    Returns image/png bytes on success (Content-Type: image/png), or JSON with
+    the hint payload + a 502 when the upstream service is unreachable. 400 on a
+    bad/missing URL.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    timeout = max(5, min(30, int(request.values.get("timeout") or 15)))
+    width = max(320, min(2400, int(request.values.get("width") or 1200)))
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+
+    encoded = urlquote(url, safe="")
+    # microlink.io: ?screenshot returns PNG bytes when meta=false & element=false.
+    shot_url = ("https://api.microlink.io/?url=%s&screenshot&meta=false"
+                "&element=false&embed=screenshot.url&viewport.device=desktop"
+                "&viewport.width=%d" % (encoded, width))
+
+    _UA = "Mozilla/5.0 (compatible; LinkPeek/1.0; +https://github.com/linkpeek)"
+    opener = build_opener(ProxyHandler())
+    try:
+        req = Request(shot_url, headers={"User-Agent": _UA,
+                                         "Accept": "image/png, */*"})
+        resp = opener.open(req, timeout=timeout)
+        data = resp.read(8 * 1024 * 1024)  # cap at 8 MiB
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+    except HTTPError as e:
+        # microlink returns JSON errors on bad/metered requests; surface as 502.
+        try:
+            detail = e.read(1024).decode("utf-8", "ignore")
+        except Exception:
+            detail = e.reason
+        record_billing(g.meter_key, g.plan, "screenshot-fail:%s" % url[:150])
+        return jsonify(error="upstream_http_%s" % e.code, detail=detail,
+                       hint=_screenshot_hint(url)), 502
+    except _FETCH_EXC as e:
+        record_billing(g.meter_key, g.plan, "screenshot-fail:%s" % url[:150])
+        return jsonify(error="upstream_unreachable", detail=str(e)[:150],
+                       hint=_screenshot_hint(url)), 502
+
+    # Only stream PNG/image bytes; anything else is upstream spam/error HTML.
+    if not (ctype.startswith("image/") or data[:8] == b"\x89PNG\r\n\x1a\n"):
+        record_billing(g.meter_key, g.plan, "screenshot-fail:%s" % url[:150])
+        return jsonify(error="upstream_not_image",
+                       content_type=ctype,
+                       hint=_screenshot_hint(url)), 502
+
+    record_billing(g.meter_key, g.plan, "screenshot:%s" % url[:150])
+    return Response(data, mimetype="image/png",
+                    headers={"Content-Type": "image/png",
+                             "X-LinkPeek-Source": "microlink.io",
+                             "Cache-Control": "public, max-age=3600"})
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)

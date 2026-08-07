@@ -27,6 +27,8 @@ Single Flask app. Endpoints:
     GET  /api/sitemap-parse    parse a sitemap.xml URL into {urls:[…], sitemaps:[…]}
     GET  /api/og-image-proxy   fetch + proxy an og:image/the twitter:image bytes
     GET  /api/redirect-chain   follow a URL's HTTP redirects, report every hop
+    GET  /api/content-type     GET headers only -> {content_type, charset, server, ...}
+    GET  /api/ssl-info         TLS cert + protocol + cipher for an https URL
     GET  /lp/<code>            302-redirect for a short code
 """
 
@@ -89,7 +91,7 @@ _FETCH_EXC = (
 )
 
 # Service metadata for /api/status
-__version__ = "1.8.3"
+__version__ = "1.8.4"
 _START_TIME = time.time()
 
 
@@ -2397,6 +2399,215 @@ def _extract_microdata(html_text: str) -> list:
     return out
 
 
+# ============================================================================
+# Content-Type probe — headers-only fetch returning the parsed content type,
+# charset, content length, server, and last-modified. Cheaper than /api/headers
+# (one structured answer) and cheaper than /api/preview (no body parse).
+# ============================================================================
+def _parse_content_type(value: str) -> tuple[str, str]:
+    """Split a Content-Type header into (mime, charset). charset may be ''."""
+    if not value:
+        return ("", "")
+    parts = [p.strip() for p in value.split(";")]
+    mime = parts[0].lower() if parts else ""
+    charset = ""
+    for p in parts[1:]:
+        if p.lower().startswith("charset="):
+            charset = p.split("=", 1)[1].strip().strip('"')
+    return (mime, charset)
+
+
+@app.route("/api/content-type")
+@rate_limit(app)
+def api_content_type():
+    """Headers-only probe returning the parsed content type for a URL.
+
+    Query: ?url=https://...  (required)
+    Returns: url, final_url, content_type (mime), content_length, server,
+    last_modified, status_code, charset. Issued as a GET but only 1 byte of
+    the body is read (the response headers must materialise). 502 on fetch
+    failure, 400 on a bad/missing URL (before any network call).
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    opener = build_opener(ProxyHandler())
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; LinkPeek/1.0; +https://github.com/linkpeek)",
+            "Accept": "*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate",
+        },
+        method="GET",
+    )
+    status = 200
+    headers: dict = {}
+    final_url = url
+    try:
+        resp = opener.open(req, timeout=8.0)
+        _ = resp.read(1)  # trigger the response headers
+        final_url = resp.geturl()
+        status = resp.getcode() or 200
+        headers = {k: v for k, v in resp.headers.items()}
+    except HTTPError as e:
+        final_url = e.url or url
+        status = e.code
+        try:
+            e.read(1)
+        except (OSError, AttributeError):
+            pass
+        headers = {k: v for k, v in (e.headers or {}).items()}
+    except _FETCH_EXC as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+    ctype_raw = headers.get("Content-Type") or headers.get("content-type") or ""
+    mime, charset = _parse_content_type(ctype_raw)
+    out = {
+        "url": url,
+        "final_url": final_url,
+        "content_type": mime,
+        "charset": charset,
+        "content_length": headers.get("Content-Length") or headers.get("content-length") or "",
+        "server": headers.get("Server") or headers.get("server") or "",
+        "last_modified": headers.get("Last-Modified") or headers.get("last-modified") or "",
+        "status_code": status,
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "content-type:%s" % url[:150])
+    return jsonify(out)
+
+
+# ============================================================================
+# SSL/TLS info — connect an ssl-wrapped socket, report cert + protocol + cipher.
+# https URLs only (caller passes https:// or a bare host we promote to https).
+# ============================================================================
+def _rdn_to_dict(rdn) -> dict:
+    """Flatten an ssl.py 'subject'/'issuer' field into {key: value}.
+
+    getpeercert() returns subject/issuer as a tuple of RDNs, where each RDN
+    is itself a sequence of (type, value) 2-tuples — e.g.
+        ((('commonName', 'example.com'),),)
+        ((('countryName', 'US'),), (('organizationName', 'Sectigo'),))
+    We collapse two levels: for each RDN, for each (k, v) pair, set out[k]=v.
+    Later pairs win on key collision (reasonable for the rare duplicate-O).
+    A bare dict or a flat [(k,v), ...] list is also accepted for robustness.
+    """
+    out: dict = {}
+    if not rdn:
+        return out
+    if isinstance(rdn, dict):
+        return dict(rdn)
+    try:
+        for entry in rdn:
+            # entry may be an RDN (sequence of (k,v) pairs) or, defensively,
+            # a flat (k, v) 2-tuple if a caller passed a pre-flattened list.
+            if isinstance(entry, (tuple, list)) and len(entry) == 2 and not isinstance(entry[0], (tuple, list)):
+                out[str(entry[0])] = entry[1]
+                continue
+            for pair in entry:
+                if isinstance(pair, (tuple, list)) and len(pair) == 2:
+                    out[str(pair[0])] = pair[1]
+    except (TypeError, ValueError):
+        pass
+    return out
+
+
+def _ssl_probe(host: str, port: int, timeout: float = 8.0) -> dict:
+    """Open an ssl-wrapped socket and extract cert + protocol + cipher.
+
+    Two-pass: first a fully-verified context (CERT_REQUIRED) to materialise
+    a parsed cert dict (valid=True); if that handshake fails (expired /
+    self-signed / hostname mismatch), fall back to CERT_NONE so we can at
+    least report the negotiated protocol + cipher (valid=False). If even
+    the unverified handshake fails the caller surfaces it as ssl_error.
+    """
+    # Pass 1 — verified. getpeercert() returns a dict only when verify path
+    # succeeded; with CERT_NONE it returns {} even if a cert was seen.
+    out: dict = {"valid": False, "issuer": {}, "subject": {}, "not_after": ""}
+    try:
+        ctx = ssl.create_default_context()
+        raw = socket.create_connection((host, port), timeout=timeout)
+        with ctx.wrap_socket(raw, server_hostname=host) as ss:
+            cert = ss.getpeercert() or {}
+            if cert:
+                out["valid"] = True
+                out["issuer"] = _rdn_to_dict(cert.get("issuer", []))
+                out["subject"] = _rdn_to_dict(cert.get("subject", []))
+                out["not_after"] = cert.get("notAfter", "") or cert.get("not_after", "")
+            out["protocol"] = ss.version() or ""
+            c = ss.cipher()
+            if c:
+                out["cipher"] = {"name": c[0], "version": c[1], "bits": c[2]}
+        return out
+    except (ssl.SSLError, socket.error):
+        pass
+    # Pass 2 — unverified. We still negotiate TLS and can report protocol +
+    # cipher, but the cert fields stay empty and valid stays False.
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        raw = socket.create_connection((host, port), timeout=timeout)
+        with ctx.wrap_socket(raw, server_hostname=host) as ss:
+            out["protocol"] = ss.version() or ""
+            c = ss.cipher()
+            if c:
+                out["cipher"] = {"name": c[0], "version": c[1], "bits": c[2]}
+    except (ssl.SSLError, socket.error):
+        raise
+    return out
+
+
+@app.route("/api/ssl-info")
+@rate_limit(app)
+def api_ssl_info():
+    """Report TLS certificate + protocol + cipher for an https URL.
+
+    Query: ?url=https://...  (required; scheme must be https)
+    Returns: url, host, port, valid (bool), issuer (dict), subject (dict),
+    not_after, protocol, cipher (dict)). 400 if the URL is not https or is
+    malformed; 502 if the TLS handshake fails (incl. unreachable host).
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    parts = urlsplit(url)
+    if parts.scheme.lower() != "https":
+        return jsonify(error="ssl-info requires an https URL"), 400
+    host = parts.hostname or ""
+    if not host:
+        return jsonify(error="invalid host"), 400
+    port = parts.port or 443
+    try:
+        probe = _ssl_probe(host, port)
+    except _FETCH_EXC as e:
+        # ssl.SSLError and socket.error/OSError are already in _FETCH_EXC,
+        # so this single clause covers every handshake/connect failure.
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+    out = {
+        "url": url,
+        "host": host,
+        "port": port,
+        "valid": probe["valid"],
+        "issuer": probe["issuer"],
+        "subject": probe["subject"],
+        "not_after": probe["not_after"],
+        "protocol": probe.get("protocol", ""),
+        "cipher": probe.get("cipher", {}),
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "ssl-info:%s" % host[:150])
+    return jsonify(out)
+
+
 @app.route("/api/structured-data")
 @rate_limit(app)
 def api_structured_data():
@@ -2454,6 +2665,10 @@ def api_status():
     full list of registered API routes with their methods. Useful for SDK
     clients and for a landing-page client to render an endpoint catalogue
     dynamically.
+    New in 1.8.4: /api/content-type (headers-only fetch -> content_type,
+    charset, server, last_modified, status_code), /api/ssl-info (TLS cert
+    issuer/subject/expiry + protocol + cipher for an https URL).
+    35 registered endpoints total.
     New in 1.7.1: /api/sitemap-parse (parses sitemap.xml URL → URLs+sub-sitemaps),
     /api/og-image-proxy (proxies the og:image bytes for a page, with a byte cap),
     decorators.py type-annotation corruption fix (``***`` -> ``str``).

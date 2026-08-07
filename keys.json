@@ -176,5 +176,21 @@
     "expires_ts": 0,
     "paid": false,
     "source": "self_serve_subscribe"
+  },
+  "lp_pro_m9RZIYAEQU5vfy0e-B57-w": {
+    "email": "test@test.com",
+    "plan": "pro",
+    "issued": "2026-08-07",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
+  },
+  "lp_pro_kiwI_VTurXtzue8Q8Tycew": {
+    "email": "test2@test.com",
+    "plan": "pro",
+    "issued": "2026-08-07",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
   }
 }

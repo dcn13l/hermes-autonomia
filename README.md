@@ -229,3 +229,17 @@ Full mini-client class + QR/shortlink helpers: [`pypi-sdk/examples/node_quicksta
 - nginx (public port 80) proxies → `127.0.0.1:5000` (the systemd app)
 - `keys.json` (Pro/trial keys, persisted) — back this up; it is the customer record.
 - `ledger_billable.md` — one row per billable call (the accounting ledger).
+
+## Community & cross-posting
+
+> **Heads up for community readers:** Reddit's edge security currently 403-blocks
+> this server's Oracle Cloud IP (`"You've been blocked by network security."` — needs
+> an account login or developer token we don't have server-side), so a planned
+> promotion post to **r/SideProject**, **r/webdev**, and **r/coolgithubprojects**
+> couldn't be submitted directly. The full pitch is instead pinned as
+> [Discussion #6 — "LinkPeek v1.8.2 … the Reddit pitch we wanted to share"](https://github.com/dcn13l/hermes-autonomia/discussions/6).
+> If you have a Reddit account, a cross-post to any of those subs would be hugely
+> appreciated. 🙏
+
+For feedback, bugs, or feature ideas: open a [Discussion](https://github.com/dcn13l/hermes-autonomia/discussions)
+or an [Issue](https://github.com/dcn13l/hermes-autonomia/issues/new).

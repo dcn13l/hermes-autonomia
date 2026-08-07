@@ -40,6 +40,8 @@ import gzip
 import zlib
 import io
 import json
+import http.client
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit, quote as urlquote, urldefrag
@@ -82,6 +84,7 @@ _FETCH_EXC = (
     OSError,                # catch-all for low-level I/O surprises
     ValueError,             # _normalize_url rejections
     ssl.SSLError,
+    http.client.HTTPException,  # InvalidURL, BadStatusLine, etc. on malformed URLs
 )
 
 # Service metadata for /api/status
@@ -483,6 +486,10 @@ def api_preview():
     if not url:
         return jsonify(error="pass ?url=https://..."), 400
     try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    try:
         out = preview_link(url)
     except _FETCH_EXC as e:
         return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
@@ -498,6 +505,10 @@ def api_extract():
     url = (request.values.get("url") or "").strip()
     if not url:
         return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
     try:
         out = preview_link(url, collect_body=True)
     except _FETCH_EXC as e:
@@ -669,6 +680,10 @@ def api_opengraph():
     url = (request.values.get("url") or "").strip()
     if not url:
         return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
     try:
         out = preview_link(url)
     except _FETCH_EXC as e:
@@ -1350,6 +1365,9 @@ def api_word_count():
         return jsonify(error="pass ?url=https://..."), 400
     try:
         url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    try:
         final_url, html_text, _ = _fetch(url)
     except _FETCH_EXC as e:
         return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
@@ -1719,6 +1737,9 @@ def api_meta_tags():
         return jsonify(error="pass ?url=https://..."), 400
     try:
         url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    try:
         final_url, html_text, _ = _fetch(url)
     except _FETCH_EXC as e:
         return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
@@ -1886,6 +1907,9 @@ def api_tech_stack():
         return jsonify(error="pass ?url=https://..."), 400
     try:
         url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    try:
         final_url, html_text, headers = _fetch(url)
     except _FETCH_EXC as e:
         return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502

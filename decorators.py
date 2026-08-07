@@ -1,6 +1,46 @@
 """
 decorators.py — LinkPeek billing meter (free-tier autonomous business).
 
+═══════════════════════════════════════════════════════════════════════════
+SELF-SERVE PAYMENT FLOW — operator quick guide (read this first)
+═══════════════════════════════════════════════════════════════════════════
+Live end-to-end path (verified 2026-08-07):
+
+  Buyer hits index.html  ->  fills "you@email.com"  ->  JS calls
+  GET /api/subscribe?email=…  -> subscribe() issues a NON-EXPIRING Pro API
+  key (lp_pro_…), saves it to keys.json, and returns a JSON pay_url:
+     https://paypal.me/linkpeekpro/5.00   (pay_method="paypal")
+
+  Buyer clicks pay_url  ->  PayPal.me page opens with amount pre-filled
+  ->  buyer pays with card/PayPal balance  ->  operator's PayPal account
+  gets the $5 minus PayPal fee, with the buyer's email visible in the
+  notification.
+
+  CRITICAL: pay_method priority in subscribe() is
+     1. NowPayments crypto   (LINKPEEK_NOWPAYMENTS_KEY set  → crypto invoice)
+     2. Stripe Payment Link  (LINKPEEK_STRIPE_LINK set       → hosted checkout)
+     3. PayPal.me            (LINKPEEK_PAYPAL_ME set         → paypal.me/…/5.00)
+     4. mailto fallback      (no env set)
+  Currently only #3 is live (LINKPEEK_PAYPAL_ME=https://paypal.me/linkpeekpro).
+  The PayPal.me handle "linkpeekpro" is verified-resolving (HTTP 200, →
+  paypal.com/paypalme/linkpeekpro). The landing-page button (index.html
+  #pp-paypal) was a REPLACE_HANDLE placeholder; now points at the same URL.
+
+  RECONCILIATION (cron can't do this — human does):
+     - PayPal notifies you per transaction; the buyer's email is your key.
+     - Match the email to a key in keys.json  (grep keys.json for the email).
+     - Flip that key's `paid: false` → `paid: true` for your own accounting.
+     - NOTE: quota is NOT gated on paid==true. The Pro key works at full
+       50,000/day immediately on signup. We chose volume + trust over a
+       paywall that suppresses conversion (see subscribe() docstring).
+
+  UPGRADE PATHS (env knobs, all $0 fixed cost):
+     LINKPEEK_NOWPAYMENTS_KEY   → crypto accepted (USDC/ETH/BTC, +60 coins)
+     LINKPEEK_STRIPE_LINK       → card checkout (free Payment Link)
+     LINKPEEK_BMC / _KOFI / _GH_SPONSORS → /api/donate tip channels
+     LINKPEEK_PRO_PRICE         → dollar amount (default 5)
+═══════════════════════════════════════════════════════════════════════════
+
 Tier model (matches the live product site):
     - Free    : 100 requests/day, no key.  Metered per remote IP.
     - Pro/$5  : 50,000 requests/day, API key required.  Key-tier wins over IP tier.

@@ -47,7 +47,7 @@ Built for: Discord/Telegram bot developers, link preview cards, social sharing, 
 
 The free tier has **no API key and no signup** — just hit the endpoint.
 
-## All 34 endpoints (39 routes)
+## All 45 endpoints
 
 <details><summary><b>Click to see all endpoints</b></summary>
 

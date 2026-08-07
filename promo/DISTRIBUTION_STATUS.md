@@ -51,6 +51,21 @@ No posts were delivered to a public community from this run. The API was verifie
 
 Net new external artifacts this run: 1 issue on apis.guru, 1 release-announcement issue on the product repo, 1 PR comment bump on public-apis, and repo topic-discoverability setup. All social channels remain credential-blocked; promo drafts in this dir are unchanged and ready to paste.
 
+## Run 4 — 2026-08-07 (v1.8.6, 43 endpoints)
+
+**Real actions taken this run** (gh CLI authenticated as `dcn13l`, no Reddit/Dev.to/HN creds):
+
+- **Live API verified** from this VPS — `/api/preview`, `/api/qr`, `/api/tech-stack`, `/api/word-count`, `/api/email-validate`, `/api/readability`, `/api/meta-tags`, `/api/health`, `/api/status` all return real JSON (responses captured with `curl -s` and used as the source of truth for the post copy, not invented).
+- **GitHub Discussion #10 (Show & Tell) — POSTED LIVE:** https://github.com/dcn13l/hermes-autonomia/discussions/10  
+  Title: "I built a free API with 43 endpoints for link previews, QR codes, and web metadata"  
+  Body: genuine, 6 working `curl` examples with the real JSON shown (preview, qr, email-validate + MX, word-count, screenshot, tech-stack), full 43-endpoint table, pricing, "why I built it", and an honest note that Reddit/HN/Dev.to are blocked from this VPS + a request for a genuine cross-post.
+- **Reddit: STILL BLOCKED.** Re-confirmed live: `https://www.reddit.com/api/v1/me.json` → HTTP 403, `https://old.reddit.com/r/SideProject/new.json` → HTTP 403, OAuth `/api/v1/access_token` → HTTP 401, all with `-A "LinkPeek-bot/1.0"`. No `REDDIT_*` creds in env, no `xurl` config for Reddit (xurl is X-only anyway). No agent-platform path to an authenticated Reddit session from this environment. Drafts (`reddit_coolgithubprojects.md`, `reddit_sideproject.md`) remain unposted.
+- **Dev.to: STILL NO API KEY.** `POST https://dev.to/api/articles` → HTTP 401 (re-confirmed this run with an empty body test). `DEVTO_API_KEY` absent. `promo/devto.md` refreshed for v1.8.6/43-endpoints — frontmatter ready, `published: false`; operator only needs to set the key and `curl -X POST -H "api-key: $DEVTO_API_KEY" -d "$(jq -Rs '{article: .}' < promo/devto.md)" https://dev.to/api/articles` to publish.
+- **Hacker News: needs human account.** Saved fresh Show HN draft + posting notes to `promo/hackernews_showhn.md` (title, URL, OP body, karma-aging advice).
+- **Prior discussions (#2–#9)** still live but reference older versions (40 endpoints at most). #10 supersedes them as the canonical announcement for v1.8.6.
+
+Net new public artifact this run: **GitHub Discussion #10 (live, real)** + refreshed drafts for Dev.to and HN ready to publish when creds are supplied. Zero paid placements; zero revenue received in this run.
+
 ## Run 3 — 2026-08-07 (wake 16, v1.8.1)
 
 **Real actions taken this run:**

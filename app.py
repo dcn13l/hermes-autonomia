@@ -96,7 +96,7 @@ _FETCH_EXC = (
 )
 
 # Service metadata for /api/status
-__version__ = "1.8.5"
+__version__ = "1.9.0"
 _START_TIME = time.time()
 
 
@@ -3497,14 +3497,16 @@ def api_webhook_paypal():
                               "reason": "amount_below_threshold_" + str(amount)})
             continue
         # Upgrade: flip paid + pro, stamp audit trail.
+        previous_plan = meta.get("plan", "free")
         meta["plan"] = "pro"
         meta["paid"] = True
         meta["auto_activated"] = _time.time()
         meta["activation_source"] = "paypal_webhook"
         meta["activation_amount_usd"] = amount
-        keys[ap_key] = meta
+        # meta is already keys[ap_key] (iter returns the live dict), so no
+        # reassignment needed; persist the whole keys file below.
         activated.append({"key": ap_key, "amount_usd": amount,
-                          "previous_plan": meta.get("plan", "?")})
+                          "previous_plan": previous_plan})
 
     if activated:
         _save_keys(keys)
@@ -3767,6 +3769,306 @@ def api_screenshot():
                     headers={"Content-Type": "image/png",
                              "X-LinkPeek-Source": "microlink.io",
                              "Cache-Control": "public, max-age=3600"})
+
+
+# ============================================================================
+# /api/page-weight (1.9.0) — estimate total page resource weight from HTML
+# ============================================================================
+# Fetches the HTML at ?url=, scans for <img src>, <script src>, <link rel=stylesheet
+# href>, <iframe src>, <source srcset>, <video src>, <audio src>, and probes each
+# distinct, same-origin-or-cross-origin resource with a lightweight request that
+# reads only the response headers (Content-Length). Sums the HTML size + all
+# resource Content-Length values into an estimated transfer size. The probe is a
+# GET (many CDNs omit Content-Length on HEAD) capped at 30 resources with a 5s
+# timeout each via a thread pool so the endpoint stays well under the request
+# budget. stdlib-only, reuses _fetch + _normalize_url + rate_limit.
+# ============================================================================
+@app.route("/api/page-weight")
+@rate_limit(app)
+def api_page_weight():
+    """Estimate total page resource weight (bytes) for a URL.
+
+    Query: ?url=https://...   (required)
+    Optional: ?limit=30       cap on probed resources (1..60, default 30)
+    Optional: ?timeout=5      per-resource probe timeout seconds (2..10, default 5)
+
+    Returns: url, html_bytes, resources (list of {url, type, bytes, status}),
+    resource_count, total_bytes (html + resources with a known Content-Length),
+    total_bytes_approx (total_bytes counting unknown sizes as 0),
+    unknown_count (resources with no Content-Length). 502 on HTML fetch failure,
+    400 on a bad/missing URL.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        limit = max(1, min(60, int(request.values.get("limit") or 30)))
+        per_timeout = float(max(2, min(10, int(request.values.get("timeout") or 5))))
+    except ValueError:
+        limit, per_timeout = 30, 5.0
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    try:
+        final_url, html_text, _ = _fetch(url)
+    except _FETCH_EXC as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+
+    html_bytes = len(html_text.encode("utf-8", errors="ignore"))
+    # Resource tag -> type label. srcset (responsive images) is parsed for the
+    # first candidate URL. We only probe http(s) absolute or page-resolved URLs.
+    _RE_TO_TYPE = (
+        (re.compile(r'<img[^>]*\bsrc=["\']([^"\']+)["\']', re.I), "image"),
+        (re.compile(r'<script[^>]*\bsrc=["\']([^"\']+)["\']', re.I), "script"),
+        (re.compile(r'<link[^>]*\brel=["\']stylesheet["\'][^>]*\bhref=["\']([^"\']+)["\']', re.I), "stylesheet"),
+        (re.compile(r'<link[^>]*\bhref=["\']([^"\']+)["\'][^>]*\brel=["\']stylesheet["\']', re.I), "stylesheet"),
+        (re.compile(r'<iframe[^>]*\bsrc=["\']([^"\']+)["\']', re.I), "iframe"),
+        (re.compile(r'<video[^>]*\bsrc=["\']([^"\']+)["\']', re.I), "media"),
+        (re.compile(r'<audio[^>]*\bsrc=["\']([^"\']+)["\']', re.I), "media"),
+    )
+    _SRCSET_RE = re.compile(r'srcset=["\']([^"\']+)["\']', re.I)
+    _SOURCE_SRC_RE = re.compile(r'<source[^>]*\bsrc=["\']([^"\']+)["\']', re.I)
+
+    base = final_url
+    raw_candidates = []
+    for rx, typ in _RE_TO_TYPE:
+        for m in rx.finditer(html_text):
+            raw_candidates.append((m.group(1).strip(), typ))
+    for m in _SOURCE_SRC_RE.finditer(html_text):
+        raw_candidates.append((m.group(1).strip(), "media"))
+    # srcset: first candidate only, "url 2x" form.
+    for m in _SRCSET_RE.finditer(html_text):
+        first = m.group(1).split(",")[0].strip().split()[0]
+        if first:
+            raw_candidates.append((first, "image"))
+
+    # De-dup by resolved absolute URL, keep type of first occurrence.
+    seen = set()
+    resources = []
+    for raw, typ in raw_candidates:
+        try:
+            absu = urljoin(base, raw)
+        except Exception:
+            continue
+        if not absu:
+            continue
+        s = urlsplit(absu)
+        if s.scheme not in _ALLOWED_SCHEMES:
+            continue
+        if absu in seen:
+            continue
+        seen.add(absu)
+        resources.append({"url": absu, "type": typ})
+        if len(resources) >= limit:
+            break
+
+    _UA = "Mozilla/5.0 (compatible; LinkPeek/1.0; +https://github.com/linkpeek)"
+    opener = build_opener(ProxyHandler())
+
+    def _probe(res):
+        try:
+            req = Request(res["url"], headers={"User-Agent": _UA,
+                                              "Accept": "*/*;q=0.8",
+                                              "Accept-Encoding": "gzip, deflate"},
+                          method="GET")
+            r = opener.open(req, timeout=per_timeout)
+            r.read(1)  # trigger headers
+            clen = r.headers.get("Content-Length") or r.headers.get("content-length")
+            status = r.getcode() or 200
+        except HTTPError as e:
+            clen = e.headers.get("Content-Length") if e.headers else None
+            status = e.code
+        except _FETCH_EXC:
+            clen = None
+            status = 0
+        try:
+            b = int(clen) if clen is not None else None
+        except (TypeError, ValueError):
+            b = None
+        res["bytes"] = b
+        res["status"] = status
+        return res
+
+    out_res = []
+    if resources:
+        with ThreadPoolExecutor(max_workers=min(10, len(resources))) as ex:
+            for r in ex.map(_probe, resources):
+                out_res.append(r)
+
+    total_known = html_bytes
+    unknown = 0
+    for r in out_res:
+        if r.get("bytes") is not None:
+            total_known += r["bytes"]
+        else:
+            unknown += 1
+    out = {
+        "url": final_url,
+        "html_bytes": html_bytes,
+        "resource_count": len(out_res),
+        "resources": out_res,
+        "total_bytes": total_known,
+        "total_bytes_approx": total_known,
+        "unknown_count": unknown,
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "page-weight:%s" % final_url[:150])
+    return jsonify(out)
+
+
+# ============================================================================
+# /api/lighthouse-hint (1.9.0) — static Core Web Vitals hints from raw HTML
+# ============================================================================
+# A stdlib-only "lite Lighthouse": fetches ?url= and, WITHOUT a headless
+# browser, estimates the three Core Web Vitals (LCP/FID-INP/CLS) signals that
+# can be inferred from markup alone — render-blocking CSS/JS, image sizing
+# (width/height attributes / srcset / lazy-loading), DOM size, webfont @font-face
+# usage, and cumulative layout shift risks (images without explicit dimensions).
+# Returns a scored checklist + an estimated Lighthouse-style 0-100
+# performance_score derived from weighted sub-signals. This is a hint, not a
+# measured lab/run — the docstring and `lab_run: false` field make that clear.
+# ============================================================================
+@app.route("/api/lighthouse-hint")
+@rate_limit(app)
+def api_lighthouse_hint():
+    """Static Core Web Vitals / performance hints parsed from page HTML.
+
+    Query: ?url=https://...   (required)
+
+    Returns: url, dom_size, render_blocking (count + examples of CSS/JS in
+    <head>), images (total, with_dimensions, lazy_loaded, srcset, layout_shift
+    risk), fonts (count of @font-face), scripts (total, async, defer,
+    in_head), lab_run=false, signals (named sub-checks raw/ok), weighted
+    performance_score (0-100 heuristic, NOT a real Lighthouse run). 502 on fetch
+    failure, 400 on a bad/missing URL.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    try:
+        final_url, html_text, _ = _fetch(url)
+    except _FETCH_EXC as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+
+    head = _extract_head(html_text)
+
+    # DOM size: count opening tags (rough). Capped at a sane int.
+    dom_size = len(re.findall(r"<[a-zA-Z][^>]*>", html_text))
+
+    # Render-blocking CSS in <head>: <link rel=stylesheet> not media=print.
+    css_blocks = 0
+    css_examples = []
+    for m in re.finditer(r'<link[^>]*rel=["\']stylesheet["\'][^>]*>', html_text, re.I):
+        tag = m.group(0)
+        if 'media="print"' in tag.lower() or "media='print'" in tag.lower():
+            continue
+        css_blocks += 1
+        if len(css_examples) < 5:
+            href = re.search(r'\bhref=["\']([^"\']+)["\']', tag, re.I)
+            css_examples.append(href.group(1) if href else tag[:80])
+        else:
+            css_examples.append("")  # cap list
+
+    # Render-blocking sync <script> in <head> (no async/defer).
+    head_scripts = re.findall(r'<script[^>]*>', head, re.I)
+    sync_in_head = 0
+    for t in head_scripts:
+        if "async" in t.lower() or "defer" in t.lower():
+            continue
+        if 'type="module"' in t.lower() or "type='module'" in t.lower():
+            continue
+        sync_in_head += 1
+
+    # Images: total, with width or height attr, lazy-loaded (loading=lazy),
+    # with srcset, and layout-shift risk (images WITHOUT explicit width&height).
+    img_tags = re.findall(r'<img[^>]*>', html_text, re.I)
+    img_total = len(img_tags)
+    img_with_dims = 0
+    img_lazy = 0
+    img_srcset = 0
+    img_shift_risk = 0
+    for t in img_tags:
+        low = t.lower()
+        has_w = bool(re.search(r'\bwidth=', low))
+        has_h = bool(re.search(r'\bheight=', low))
+        if has_w and has_h:
+            img_with_dims += 1
+        else:
+            img_shift_risk += 1
+        if "loading=" in low and ("lazy" in low):
+            img_lazy += 1
+        if "srcset=" in low:
+            img_srcset += 1
+
+    fonts = len(re.findall(r"@font-face", html_text, re.I))
+
+    all_scripts = re.findall(r'<script[^>]*>', html_text, re.I)
+    total_scripts = len(all_scripts)
+    async_count = sum(1 for t in all_scripts if "async" in t.lower())
+    defer_count = sum(1 for t in all_scripts if "defer" in t.lower())
+
+    # Heuristic sub-signals (each: 1 = good, 0 = risky).
+    signals = {
+        # Render-blocking: penalised when CSS in <head> > 2 or sync head scripts.
+        "render_blocking_low": css_blocks <= 2 and sync_in_head == 0,
+        # Images sized (CLS proxy): majority have width+height.
+        "images_sized": img_with_dims >= img_total * 0.6 if img_total else True,
+        # Lazy loading present: at least one lazy image (LCP friendliness proxy).
+        "lazy_loading_used": img_lazy > 0,
+        # Responsive images: srcset used.
+        "responsive_images": img_srcset > 0,
+        # Small DOM (< ~1500 nodes Lighthouse target).
+        "dom_size_small": dom_size < 1500,
+        # Few webfonts (each font adds layout shift / fetch cost).
+        "fonts_few": fonts <= 2,
+        # Scripts deferred/async (INP/FID friendliness proxy).
+        "scripts_non_blocking": (async_count + defer_count) >= total_scripts * 0.5 if total_scripts else True,
+    }
+    weighted = {
+        "render_blocking_low": 0.25,
+        "images_sized": 0.25,
+        "lazy_loading_used": 0.10,
+        "responsive_images": 0.10,
+        "dom_size_small": 0.15,
+        "fonts_few": 0.05,
+        "scripts_non_blocking": 0.10,
+    }
+    perf_score = round(sum(weighted[k] for k, v in signals.items() if v) * 100)
+
+    out = {
+        "url": final_url,
+        "lab_run": False,
+        "note": "Static hints parsed from HTML markup only; not a measured Lighthouse lab run.",
+        "dom_size": dom_size,
+        "render_blocking": {
+            "css_count": css_blocks,
+            "sync_scripts_in_head": sync_in_head,
+            "css_examples": [e for e in css_examples if e][:5],
+        },
+        "images": {
+            "total": img_total,
+            "with_dimensions": img_with_dims,
+            "lazy_loaded": img_lazy,
+            "with_srcset": img_srcset,
+            "layout_shift_risk_count": img_shift_risk,
+        },
+        "fonts": fonts,
+        "scripts": {
+            "total": total_scripts,
+            "async": async_count,
+            "defer": defer_count,
+        },
+        "signals": signals,
+        "performance_score": perf_score,
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "lighthouse-hint:%s" % final_url[:150])
+    return jsonify(out)
 
 
 if __name__ == "__main__":

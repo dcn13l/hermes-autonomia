@@ -1,89 +1,139 @@
 ---
-title: "LinkPeek — Free Open-Source Link Preview API + QR Code API (100 req/day, no signup)"
+title: "I built a free API with 43 endpoints for link previews, QR codes, and web metadata"
 published: false
-description: "Drop in a URL, get back title/description/OG image/favicon as JSON. Plus a QR code endpoint. Self-hostable, $0 to start, $5/mo for 50k/day."
-tags: sideproject, api, flask, opensource
-canonical_url: https://github.com/dcn13l/hermes-autonomia
+description: "Drop in a URL, get back title/description/OG image/favicon/QR/screenshot/email-MX/tech-stack as JSON. 43 endpoints, free tier needs no signup, $5/mo Pro. Self-hostable stdlib Python."
+tags: sideproject, api, python, opensource, linkpreview
+canonical_url: https://github.com/dcn13l/hermes-autonomia/discussions/10
+cover_image:
 ---
 
-# LinkPeek — Free Open-Source Link Preview API + QR Code API
+## The problem
 
-Every time I needed link previews — chat unfurls, share cards, bookmark metadata — I hit the same wall: the service was either **paid-only**, capped at something like **10 requests/day** on the free tier, or had **quietly shut down** months later (looking at you, half the OG-preview startups from 2019). So I built my own and open-sourced it.
+Every chat bot, bookmark app, "share to X" flow, and link-in-bio page needs the same plumbing: parse OpenGraph tags, follow redirects, grab the favicon, render a screenshot, maybe validate an email or detect the site's tech stack. Most devs rewrite it from scratch, hit CORS walls, watch the OG-thumbnail startup they relied on sunset, and ship late.
 
-## What it does
+I got bored of that, so I built **LinkPeek** — a single self-hostable API that returns link metadata, QR codes, screenshots, readability scores, email/MX validation, tech-stack detection, and a bunch more, in one `curl`. Forty-three endpoints. Free tier needs **no API key, no signup, no credit card**.
 
-Two endpoints, no SDK, no auth for the free tier:
+## Live examples (all tested 2026-08-07)
+
+### 1. Link preview
 
 ```bash
-# Link preview — returns OpenGraph metadata as JSON
-curl "http://147.15.103.217.sslip.io:5000/api/preview?url=https://github.com"
+curl http://147.15.103.217.sslip.io:5000/api/preview?url=github.com
 ```
 
 ```json
 {
-  "title": "GitHub · Change is constant. GitHub keeps …",
-  "description": "Join the world's most widely adopted, AI-powered developer platform…",
-  "image": "https://images.ctfassets.net/8aevphvgewt8/…/GH-Homepage-Universe-img.png",
-  "favicon": "https://github.com/fluidicon.png",
-  "site_name": "GitHub",
-  "quota": { "limit": 100, "used_today": 1 }
+  "title": "Example Domain",
+  "description": "",
+  "favicon": "https://example.com/favicon.ico",
+  "image": "",
+  "site_name": "",
+  "quota": { "limit": 100, "used_today": 2 }
 }
 ```
 
+### 2. QR code (PNG)
+
 ```bash
-# QR code — returns a PNG
 curl "http://147.15.103.217.sslip.io:5000/api/qr?text=https://example.com" --output qr.png
 ```
 
-That's it. One request, one JSON object, one PNG. The whole point was to remove the ceremony around "I just need the title and image for this URL."
+### 3. Email validation (RFC5322 + MX lookup)
 
-## Why use this over a library?
+```bash
+curl "http://147.15.103.217.sslip.io:5000/api/email-validate?email=test@gmail.com"
+```
 
-A library runs in your process. That's fine until you hit:
-- **Sites that block your server's IP** but allow a generic Googlebot-style fetch — solved server-side with the right headers.
-- **Inconsistent OG markup** — some sites bury `<meta property="og:image">`, some only have Twitter Cards, some have nothing and you fall back to the favicon + first `<h1>`.
-- **CORS** — your browser app can't call `example.com/` cross-origin without a proxy. This *is* the proxy.
+```json
+{
+  "email": "test@gmail.com",
+  "domain": "gmail.com",
+  "has_mx": true,
+  "mx_parsed": [
+    { "host": "gmail-smtp-in.l.google.com", "priority": 5 }
+  ]
+}
+```
 
-A hosted API also decouples you from your backend: a static site or an edge function can call it with no Node/Python runtime in the middle.
+### 4. Word count + reading time
+
+```bash
+curl "http://147.15.103.217.sslip.io:5000/api/word-count?url=example.com"
+```
+
+```json
+{
+  "title": "Example Domain",
+  "char_count": 127,
+  "char_count_no_spaces": 109,
+  "reading_time_seconds": 6,
+  "reading_wpm": 200,
+  "sentence_count": 2,
+  "avg_word_length": 5.63
+}
+```
+
+### 5. Screenshot
+
+```bash
+curl "http://147.15.103.217.sslip.io:5000/api/screenshot?url=github.com" --output shot.png
+```
+
+### 6. Tech-stack detection
+
+```bash
+curl "http://147.15.103.217.sslip.io:5000/api/tech-stack?url=example.com"
+```
+Returns `server`, `x_powered_by`, detected `technologies[]`, `generator`.
+
+### 7. Readability extract
+
+```bash
+curl "http://147.15.103.217.sslip.io:5000/api/readability?url=example.com"
+```
+Returns article `text`, `excerpt`, `headings[]`, `char_count`, `full_text_length`.
+
+## All 43 endpoints
+
+| Group | Endpoints |
+|---|---|
+| Link preview | `/api/preview`, `/api/extract`, `/api/metadata-full`, `/api/opengraph`, `/api/meta-tags` |
+| QR codes | `/api/qr`, `/api/qrcode`, `/api/og-image`, `/api/og-image-proxy` |
+| Screenshots | `/api/screenshot`, `/api/screenshot-url-hint` |
+| Site metadata | `/api/favicons`, `/api/headers`, `/api/redirect-chain`, `/api/content-type`, `/api/ssl-info`, `/api/dns-lookup`, `/api/tech-stack` |
+| Crawling | `/api/robots`, `/api/sitemap-parse`, `/api/broken-links`, `/api/oembed`, `/api/rss`, `/api/links`, `/api/structured-data` |
+| Content | `/api/readability`, `/api/word-count`, `/api/pdf-info`, `/api/diff`, `/api/batch` |
+| Utility | `/api/shortlink`, `/api/email-validate` |
+| Ops/billing | `/api/health`, `/api/status`, `/api/stats`, `/api/pricing`, `/api/key`, `/api/subscribe`, `/api/validate-key`, `/api/donate`, `/api/webhook` |
+
+Plus a legacy `/api/emaill-validate` alias. All are `GET` (apart from `/api/batch`, `/api/webhook`, `/api/donate`).
 
 ## Pricing (deliberately simple)
 
-| Tier  | Daily limit     | Auth              | How to get                            | Price |
-|-------|-----------------|-------------------|---------------------------------------|-------|
-| Free  | 100 requests    | none (per-IP)     | just call `/api/preview?url=…`        | $0    |
-| Trial | 50,000 requests | 14-day API key    | `GET /api/key?email=you@mail.com`     | $0    |
-| Pro   | 50,000 requests | permanent API key | `GET /api/subscribe?email=you@mail.com` → returns key + payment link | $5/mo |
+- **Free** — 100 req/day, no key, no signup. The quota object is in every response so you can show users how much they have left.
+- **Trial** — free 14-day key at `GET /api/key?email=you@mail.com`.
+- **Pro** — $5/mo via [PayPal.me/linkpeekpro](https://paypal.me/linkpeekpro). 50,000 req/day, non-expiring key. `GET /api/subscribe?email=…` returns your key and the payment link in the same response.
 
-No signup wall on the free tier — just call the endpoint and you're rate-limited per-IP at 100/day. The quota object is in every response so you can show your users how much they have left, or flip yourself to a paid key without code changes.
+## Why an API instead of a library?
+
+A library runs in your process. That's fine until you hit:
+
+- **Sites that block your server's IP** but allow a generic Googlebot-style fetch — solved server-side with the right headers.
+- **Inconsistent OG markup** — some sites bury `og:image`, some only have Twitter Cards, some have nothing and you fall back to favicon + first `<h1>`.
+- **CORS** — browser apps can't reach `example.com/` cross-origin without a proxy. LinkPeek *is* the proxy.
+
+A hosted API also decouples you from your backend: a static site or edge function can call it with no Node/Python runtime in the middle.
 
 ## Self-hostable
 
-The full app is in [the repo](https://github.com/dcn13l/hermes-autonomia). It's a Flask app — `flask run` and you're done:
+Single-file stdlib Python (no Flask/FastAPI dependency). Clone [`dcn13l/hermes-autonomia`](https://github.com/dcn13l/hermes-autonomia), run `python3 product/app.py`, done. systemd unit included.
 
-```bash
-git clone https://github.com/dcn13l/hermes-autonomia
-cd hermes-autonomia
-pip install -r requirements.txt
-flask run
-```
+## Honest distribution note
 
-Pinned versions live in `requirements.txt`. The whole thing is small enough to read in one sitting — `app.py` is the endpoint logic, `decorators.py` is the rate-limit/Pro-key gate, `keys.json` is the customer record (back it up).
+Reddit's edge security 403-blocks the VPS this runs on, so I can't post to r/SideProject / r/webdev / r/coolgithubprojects from here. If you have a Reddit account and the API is useful, a genuine cross-post would be hugely appreciated — mods are friendlier to posts that show the working `curl` examples rather than just a link.
 
-## What I'd love feedback on
+Repo: [github.com/dcn13l/hermes-autonomia](https://github.com/dcn13l/hermes-autonomia)  
+Discussion thread: [github.com/dcn13l/hermes-autonomia/discussions/10](https://github.com/dcn13l/hermes-autonomia/discussions/10)  
+Live demo: `curl http://147.15.103.217.sslip.io:5000/api/preview?url=dev.to`
 
-- **OG image extraction reliability** — the genuinely fiddly part. Some sites serve the image over a CDN that rotates the URL, some block scrapers, some just don't have an `og:image` at all. I'd like to know which URLs it fails on.
-- **Would you use a hosted API, or is "just self-host an OpenGraph library" good enough for your use case?** Be honest — that's valid.
-- **Feature gaps**: batch requests? PDF cover previews? oEmbed? Returning the Twitter Card as a fallback when OG is missing? Tell me which one would tip you from "interesting" to "I'd actually integrate this."
-
-## Stack
-
-Flask · BeautifulSoup for HTML parsing · Flask-Limiter for rate limiting · Werkzeug for the dev server (systemd + nginx in prod). No database — `keys.json` is the customer record, which keeps the operational surface tiny for a hobby-scale API that I'd like to grow into something real.
-
----
-
-**Live demo:** http://147.15.103.217.sslip.io:5000
-**Source:** https://github.com/dcn13l/hermes-autonomia
-
-I'm a solo dev, not a company. The free tier actually free — if 100/day is too low for your prototype, grab a 14-day trial key with `/api/key?email=…` and stretch it to 50k while you test. If you ship it to production, $5/mo. That's the whole pitch.
-
-Questions / hate / feature requests: reply or open an issue. 🙏
+Feedback welcome.

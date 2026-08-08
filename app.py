@@ -45,6 +45,9 @@ Single Flask app. Endpoints:
     GET  /api/qr-with-logo   QR code with embedded centred logo (PNG or base64)
     GET  /api/hash-text      compute md5/sha1/sha256/sha512 hashes for ?text=
     GET  /api/uuid           generate v1/v4/v5 UUIDs (?count=, ?namespace=, ?name=)
+    GET  /api/base64         base64 encode/decode arbitrary text (?urlsafe=)
+    GET  /api/url-encode      percent-encode/decode a URL component (?safe=)
+    GET  /api/timestamp      unix epoch <-> ISO 8601 converter (?unix=, ?iso=)
     GET  /lp/<code>            302-redirect for a short code
 """
 
@@ -63,7 +66,10 @@ import http.client
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlsplit, quote as urlquote, urldefrag
+from urllib.parse import (
+    urljoin, urlsplit, quote as urlquote, unquote as urlunquote,
+    urldefrag,
+)
 from urllib.request import Request, urlopen, build_opener, ProxyHandler
 from urllib.error import URLError, HTTPError
 
@@ -6061,6 +6067,242 @@ def api_uuid():
     }
     out["quota"] = quota_echo(g)
     record_billing(g.meter_key, g.plan, "uuid:%s:%d" % (version, count))
+    return jsonify(out)
+
+
+# ============================================================================
+# /api/base64 — base64 encode/decode arbitrary text or binary data.
+# ============================================================================
+# Pure stdlib (base64). Supports both text (?text=) and hex (?hex=) input.
+# Useful for JWT debugging, data-URI generation, API auth tokens, etc.
+@app.route("/api/base64")
+@rate_limit(app)
+def api_base64():
+    """Base64 encode or decode a string.
+
+    Query: ?text=<string>        text to encode (mode=encode, default)
+            ?b64=<string>         base64 to decode (mode=decode)
+            ?action=encode|decode override mode selection (default: encode)
+            ?urlsafe=1             use URL-safe alphabet (-_ instead of +/)
+
+    If?action=encode is given (or only ?text= is supplied) the text is
+    UTF-8 encoded then base64-encoded. If ?action=decode (or ?b64= is
+    supplied) the input is base64-decoded and returned as text (UTF-8) plus
+    hex. 400 on missing input; 400 on bad base64 payload.
+    """
+    import base64
+
+    action = (request.values.get("action") or "").strip().lower()
+    text_param = request.values.get("text")
+    b64_param = request.values.get("b64")
+    urlsafe = request.values.get("urlsafe", "").strip() in ("1", "true", "yes")
+
+    b64_encode = base64.urlsafe_b64encode if urlsafe else base64.b64encode
+    # validate=True so non-alphabet chars raise binascii.Error instead of being
+    # silently discarded (matches the documented 400-on-bad-payload contract).
+    b64_decode = (
+        lambda s: base64.urlsafe_b64decode(s)
+        if urlsafe
+        else base64.b64decode(s, validate=True)
+    )
+
+    # Decide mode: explicit ?action= wins; else ?b64= implies decode, ?text= encode.
+    if action == "decode":
+        mode = "decode"
+    elif action == "encode":
+        mode = "encode"
+    elif b64_param is not None:
+        mode = "decode"
+    else:
+        mode = "encode"
+
+    try:
+        if mode == "decode":
+            raw_b64 = (b64_param if b64_param is not None else text_param)
+            if raw_b64 is None:
+                return jsonify(error="pass ?b64=<base64> or ?action=decode&text=<base64>"), 400
+            decoded_bytes = b64_decode(raw_b64)
+            out = {
+                "action": "decode",
+                "input": raw_b64 if len(raw_b64) <= 200 else raw_b64[:200] + "…",
+                "decoded": decoded_bytes.decode("utf-8", errors="replace"),
+                "decoded_hex": decoded_bytes.hex(),
+                "byte_length": len(decoded_bytes),
+                "urlsafe": urlsafe,
+            }
+        else:
+            if text_param is None:
+                return jsonify(error="pass ?text=<string>"), 400
+            encoded = b64_encode(text_param.encode("utf-8", errors="replace")).decode("ascii")
+            out = {
+                "action": "encode",
+                "input": text_param if len(text_param) <= 200 else text_param[:200] + "…",
+                "encoded": encoded,
+                "urlsafe": urlsafe,
+            }
+    except (ValueError, base64.binascii.Error) as exc:
+        return jsonify(error="invalid_base64", detail=str(exc)), 400
+
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "base64:%s" % mode)
+    return jsonify(out)
+
+
+# ============================================================================
+# /api/url-encode — percent-encoding / URL-decoding helper.
+# ============================================================================
+# Pure stdlib (urllib.parse). Useful for building query strings, debugging
+# double-encoding issues, and sanitising user input for URL construction.
+@app.route("/api/url-encode")
+@rate_limit(app)
+def api_url_encode():
+    """Percent-encode or decode a URL component.
+
+    Query: ?text=<string>        text to percent-encode (mode=encode, default)
+            ?encoded=<string>    percent-encoded string to decode (mode=decode)
+            ?action=encode|decode override mode selection (default: encode)
+            ?safe=<chars>         characters to leave unencoded (default: '')
+
+    Returns the encoded/decoded string plus byte_length. 400 on missing input.
+    """
+    action = (request.values.get("action") or "").strip().lower()
+    text_param = request.values.get("text")
+    encoded_param = request.values.get("encoded")
+    safe_chars = request.values.get("safe") or ""  # default: encode everything
+
+    if action == "decode":
+        mode = "decode"
+    elif action == "encode":
+        mode = "encode"
+    elif encoded_param is not None:
+        mode = "decode"
+    else:
+        mode = "encode"
+
+    try:
+        if mode == "decode":
+            raw = encoded_param if encoded_param is not None else text_param
+            if raw is None:
+                return jsonify(error="pass ?encoded=<string> or ?action=decode&text=<string>"), 400
+            # Use urllib.parse.unquote to handle percent-encoded bytes → chars.
+            decoded = urlunquote(raw)
+            out = {
+                "action": "decode",
+                "input": raw if len(raw) <= 200 else raw[:200] + "…",
+                "decoded": decoded,
+                "byte_length": len(decoded.encode("utf-8", errors="replace")),
+            }
+        else:
+            if text_param is None:
+                return jsonify(error="pass ?text=<string>"), 400
+            encoded = urlquote(text_param, safe=safe_chars)
+            out = {
+                "action": "encode",
+                "input": text_param if len(text_param) <= 200 else text_param[:200] + "…",
+                "encoded": encoded,
+                "byte_length": len(text_param.encode("utf-8", errors="replace")),
+            }
+    except (ValueError, UnicodeDecodeError) as exc:
+        return jsonify(error="invalid_percent_encoding", detail=str(exc)), 400
+
+    out["safe"] = safe_chars
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "url-encode:%s" % mode)
+    return jsonify(out)
+
+
+# ============================================================================
+# /api/timestamp — Unix epoch ↔ human-readable time converter.
+# ============================================================================
+# Pure stdlib (datetime). Converts either direction: a unix epoch seconds
+# (or ms) value → ISO 8601 / RFC 822 strings, or an ISO 8601 string → epoch.
+# Works in UTC. Useful for log parsing, database migrations, API debugging.
+@app.route("/api/timestamp")
+@rate_limit(app)
+def api_timestamp():
+    """Convert between Unix epoch and ISO 8601 timestamps (UTC).
+
+    Query: ?unix=1691500000         epoch seconds (or ms if >10¹⁰) → ISO 8601
+            ?iso=2026-08-08T12:00:00  ISO 8601 string → epoch seconds + ms
+            ?unit=s|ms               force interpretation as seconds or
+                                      milliseconds (default: auto-detect)
+
+    If neither ?unix= nor ?iso= is given, returns the current UTC time in
+    multiple formats. 400 on unparseable ISO input.
+    """
+    import datetime as _dt
+    from datetime import timezone
+
+    iso_param = request.values.get("iso")
+    unix_param = request.values.get("unix")
+    unit = (request.values.get("unit") or "").strip().lower()
+
+    def _now_block() -> dict:
+        now = _dt.datetime.now(timezone.utc)
+        return {
+            "unix": int(now.timestamp()),
+            "unix_ms": int(now.timestamp() * 1000),
+            "iso8601": now.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+            "rfc822": now.strftime("%a, %d %b %Y %H:%M:%S GMT"),
+            "date": now.strftime("%Y-%m-%d"),
+            "time": now.strftime("%H:%M:%S"),
+        }
+
+    try:
+        if unix_param is not None:
+            try:
+                uv = float(unix_param)
+            except (ValueError, TypeError):
+                return jsonify(error="invalid_unix", detail="?unix= must be numeric"), 400
+            # Auto-detect ms vs s: if value >= 10^10 treat as ms.
+            if unit == "s":
+                secs = uv
+            elif unit == "ms":
+                secs = uv / 1000.0
+            elif uv >= 1e10:
+                secs = uv / 1000.0
+            else:
+                secs = uv
+            dt = _dt.datetime.fromtimestamp(secs, tz=timezone.utc)
+            out = {
+                "unix": int(secs),
+                "unix_ms": int(secs * 1000),
+                "iso8601": dt.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                "rfc822": dt.strftime("%a, %d %b %Y %H:%M:%S GMT"),
+                "date": dt.strftime("%Y-%m-%d"),
+                "time": dt.strftime("%H:%M:%S"),
+                "input": unix_param,
+                "interpreted_as": "ms" if (uv >= 1e10 and unit not in ("s", "ms")) else (unit or "s"),
+            }
+        elif iso_param is not None:
+            try:
+                # Accept trailing 'Z' as UTC.
+                cleaned = iso_param.strip()
+                if cleaned.endswith("Z"):
+                    cleaned = cleaned[:-1] + "+00:00"
+                dt = _dt.datetime.fromisoformat(cleaned)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                dt = dt.astimezone(timezone.utc)
+            except (ValueError, TypeError) as exc:
+                return jsonify(error="invalid_iso", detail=str(exc)), 400
+            out = {
+                "iso": iso_param,
+                "unix": int(dt.timestamp()),
+                "unix_ms": int(dt.timestamp() * 1000),
+                "iso8601": dt.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                "rfc822": dt.strftime("%a, %d %b %Y %H:%M:%S GMT"),
+                "date": dt.strftime("%Y-%m-%d"),
+                "time": dt.strftime("%H:%M:%S"),
+            }
+        else:
+            out = _now_block()
+            out["mode"] = "now"
+    except (OSError, OverflowError, ValueError) as exc:
+        return jsonify(error="timestamp_conversion_failed", detail=str(exc)), 400
+
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "timestamp:%s" % ("unix" if unix_param is not None else "iso" if iso_param is not None else "now"))
     return jsonify(out)
 
 

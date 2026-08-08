@@ -44,5 +44,28 @@
     "expires_ts": 0,
     "paid": false,
     "source": "self_serve_subscribe"
+  },
+  "lp_pro_ed51Pff7HxmhghjyLgBcBQ": {
+    "email": "test-idempotency@example.com",
+    "plan": "pro",
+    "issued": "2026-08-08",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
+  },
+  "lp_pro_GFnP-30We-MDEaZ3tH6MsA": {
+    "email": "test-revenue-check@linkpeek.example",
+    "plan": "pro",
+    "issued": "2026-08-08",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
+  },
+  "lp_SDpN8zNrwBumjV5fSkbBWQ": {
+    "email": "you@example.com",
+    "plan": "trial",
+    "issued": "2026-08-08",
+    "expires": "2026-08-22",
+    "expires_ts": 1787377819
   }
 }

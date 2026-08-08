@@ -263,68 +263,98 @@ def subscribe(email: str, host: str = "") -> dict:
 
     api_key = issue_pro_key(email)
 
+    # ── Idempotency/correctness fix ────────────────────────────────
+    # The basic minting is already idempotent (issue_pro_key returns the
+    # same key for a re-subscribe), but the response payload used to be
+    # hardcoded as ``paid: False, status: pending_payment`` regardless of
+    # the real stored state. That meant a user whose key had already been
+    # auto-activated by the PayPal webhook (paid=True) was told on every
+    # re-subscribe to pay again — a confusing, incorrect response. Look up
+    # the live metadata for the returned key and reflect the real paid
+    # state, current_effective_limit, and next_steps here.
+    keys = _load_keys()
+    stored = keys.get(api_key, {}) or {}
+    already_paid = bool(stored.get("paid"))
+    eff_limit = PRO_DAILY_LIMIT if already_paid else FREE_DAILY_LIMIT
+
     pay_url = ""
     pay_method = ""
     pay_meta = {}
-    if NOWPAYMENTS_API_KEY:
-        inv = _nowpayments_invoice(email, api_key)
-        if inv.get("invoice_url"):
-            pay_url = str(inv["invoice_url"])
-            pay_method = "nowpayments_crypto"
-            pay_meta = {
-                "invoice_id": inv.get("invoice_id", ""),
-                "pay_address": inv.get("pay_address", ""),
-                "accepted_coins": "USDC (Base), ETH, BTC, USDT, and 60+",
-            }
+    # When the key is already paid there is nothing to bill; surface an empty
+    # pay_url instead of re-generating a payment link that would re-charge an
+    # already-active customer. The next_steps block below branches on this too.
+    if not already_paid:
+        if NOWPAYMENTS_API_KEY:
+            inv = _nowpayments_invoice(email, api_key)
+            if inv.get("invoice_url"):
+                pay_url = str(inv["invoice_url"])
+                pay_method = "nowpayments_crypto"
+                pay_meta = {
+                    "invoice_id": inv.get("invoice_id", ""),
+                    "pay_address": inv.get("pay_address", ""),
+                    "accepted_coins": "USDC (Base), ETH, BTC, USDT, and 60+",
+                }
 
-    # Separate chain (not elif on the NowPayments block) so that a failed
-    # NowPayments invoice — key set but API down — still falls through to a
-    # working pay_url instead of returning an empty one.
-    if not pay_url and STRIPE_LINK:
-        # Stripe Payment Link: append the customer email so reconciliation is automatic.
-        sep = "&" if "?" in STRIPE_LINK else "?"
-        pay_url = "{}{}prefilled_email={}".format(STRIPE_LINK, sep, urllib.parse.quote(email))
-        pay_method = "stripe"
-    elif not pay_url and PAYPAL_ME:
-        # PayPal Me: amount goes in the path, email shows up in the notification
-        # the operator receives — they match it against the subscribed email.
-        pay_url = "{}/{:.2f}".format(PAYPAL_ME, PRO_PRICE_USD)
-        pay_method = "paypal"
-    elif not pay_url:
-        # Last-resort $0 path: a mailto asking the buyer to email the operator.
-        pay_url = (
-            "mailto:linkpeek@localhost?subject=LinkPeek%20Pro%20${:.0f}/mo"
-            "&body=Email%3A%20{}%0AKey%3A%20{}%0APlease%20send%20payment%20instructions.".format(
-                PRO_PRICE_USD, urllib.parse.quote(email), api_key
+        # Separate chain (not elif on the NowPayments block) so that a failed
+        # NowPayments invoice — key set but API down — still falls through to a
+        # working pay_url instead of returning an empty one.
+        if not pay_url and STRIPE_LINK:
+            # Stripe Payment Link: append the customer email so reconciliation is automatic.
+            sep = "&" if "?" in STRIPE_LINK else "?"
+            pay_url = "{}{}prefilled_email={}".format(STRIPE_LINK, sep, urllib.parse.quote(email))
+            pay_method = "stripe"
+        elif not pay_url and PAYPAL_ME:
+            # PayPal Me: amount goes in the path, email shows up in the notification
+            # the operator receives — they match it against the subscribed email.
+            pay_url = "{}/{:.2f}".format(PAYPAL_ME, PRO_PRICE_USD)
+            pay_method = "paypal"
+        elif not pay_url:
+            # Last-resort $0 path: a mailto asking the buyer to email the operator.
+            pay_url = (
+                "mailto:linkpeek@localhost?subject=LinkPeek%20Pro%20${:.0f}/mo"
+                "&body=Email%3A%20{}%0AKey%3A%20{}%0APlease%20send%20payment%20instructions.".format(
+                    PRO_PRICE_USD, urllib.parse.quote(email), api_key
+                )
             )
-        )
-        pay_method = "manual_email"
+            pay_method = "manual_email"
 
     # The Pro key is issued immediately and works right away, but at the
     # FREE 100/day limit. Pro quota (50k/day) only unlocks after the
     # operator flips paid:true (matching the buyer's email to a payment
-    # notification). This is the gate that was previously missing — an
-    # unpaid key used to inherit full Pro quota, so nothing forced payment.
+    # notification). For an already-paid key (e.g. a re-subscribe after a
+    # webhook activation) we reflect the live paid:true + active state so the
+    # caller is not asked to pay again.  This is the idempotency fix that was
+    # missing: the key was reused correctly, but the payload lied about paid.
+    if already_paid:
+        next_steps = [
+            "1. Your Pro key is already ACTIVE with {:,} requests/day.".format(PRO_DAILY_LIMIT),
+            "2. Payment was confirmed for this account — no further action needed.",
+            "3. Check quota any time at GET /api/validate-key?key={}.".format(api_key),
+        ]
+        status = "active"
+    else:
+        next_steps = [
+            "1. Your Pro key is live NOW but held at {} requests/day until payment is confirmed.".format(FREE_DAILY_LIMIT),
+            "2. Open pay_url and pay ${:.0f}. PayPal notifies the operator (keyed on your email).".format(PRO_PRICE_USD),
+            "3. Once reconciled, your key jumps to {:,} requests/day — no re-issue needed.".format(PRO_DAILY_LIMIT),
+            "4. Questions? Your key status is always at GET /api/validate-key?key={}.".format(api_key),
+        ]
+        status = "pending_payment"
     return {
         "email": email,
         "api_key": api_key,
         "plan": "pro",
-        "status": "pending_payment",  # active key, Free-tier quota until paid
-        "paid": False,
+        "status": status,
+        "paid": already_paid,
         "daily_limit": PRO_DAILY_LIMIT,
-        "current_effective_limit": FREE_DAILY_LIMIT,
+        "current_effective_limit": eff_limit,
         "price_usd": PRO_PRICE_USD,
         "billing_cycle": "month",
         "currency": "USD",
         "pay_url": pay_url,
         "pay_method": pay_method,
         "pay_meta": pay_meta,  # invoice_id, pay_address, accepted_coins (crypto)
-        "next_steps": [
-            "1. Your Pro key is live NOW but held at {} requests/day until payment is confirmed.".format(FREE_DAILY_LIMIT),
-            "2. Open pay_url and pay ${:.0f}. PayPal notifies the operator (keyed on your email).".format(PRO_PRICE_USD),
-            "3. Once reconciled, your key jumps to {:,} requests/day — no re-issue needed.".format(PRO_DAILY_LIMIT),
-            "4. Questions? Your key status is always at GET /api/validate-key?key={}.".format(api_key),
-        ],
+        "next_steps": next_steps,
         "pricing": plan_catalog(),
     }
 

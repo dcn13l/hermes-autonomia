@@ -33,6 +33,8 @@ Single Flask app. Endpoints:
     GET  /api/dns-lookup       resolve A/AAAA/CNAME/MX/TXT/NS records via DoH
     GET  /api/readability      extract main article text (Readability heuristics)
     GET  /api/og-image         generate a placeholder 1200x630 OG image (PNG)
+    GET  /api/json-validate    validate JSON syntax (?json= or ?url=src)
+    GET  /api/social-embed     ready-to-paste social link-card bundle (OG+Twitter)
     GET  /lp/<code>            302-redirect for a short code
 """
 
@@ -97,7 +99,7 @@ _FETCH_EXC = (
 )
 
 # Service metadata for /api/status
-__version__ = "1.9.1"
+__version__ = "1.9.2"
 _START_TIME = time.time()
 
 
@@ -4382,6 +4384,159 @@ def api_lighthouse_hint():
     out["quota"] = quota_echo(g)
     record_billing(g.meter_key, g.plan, "lighthouse-hint:%s" % final_url[:150])
     return jsonify(out)
+
+
+# ============================================================================
+# /api/json-validate (1.9.2) — validate + summarize a JSON string or fetch+validate a JSON URL
+# ============================================================================
+# POST body or ?json=<raw> validates JSON syntax without any third-party lib.
+# If ?url= is given instead, fetches that URL (must be JSON Content-Type) and
+# validates the body. Useful for link-preview consumers that ingest JSON-LD
+# payloads and want a quick "is this well-formed + what shape" check. Reuses
+# rate_limit + _normalize_url + _fetch. No new deps. Capped at 256 KiB of input
+# to keep the endpoint cheap.
+_MAX_JSON = 256 * 1024
+
+
+@app.route("/api/json-validate", methods=["GET", "POST"])
+@rate_limit(app)
+def api_json_validate():
+    """Validate a JSON payload and report a structural summary.
+
+    Query/Body:
+        ?json=<raw JSON string>   inline payload to validate (any method)
+        ?url=https://...          fetch a JSON document and validate its body
+        (exactly one of json/url is required; json takes precedence)
+
+    Returns: valid (bool), size_bytes, type ("object"/"array"/"number"/...),
+    keys (top-level keys when an object), length (for arrays), error, plus the
+    quota echo. 400 on a missing input, 422 on invalid JSON, 502 on fetch fail.
+    """
+    raw = None
+    if request.method == "POST" and request.data:
+        raw = request.get_data(as_text=True)
+    if raw is None:
+        raw = (request.values.get("json") or "").strip()
+    url = (request.values.get("url") or "").strip()
+
+    if not raw and not url:
+        return jsonify(error="pass ?json=... or ?url=..."), 400
+
+    source = "inline"
+    if raw:
+        if len(raw) > _MAX_JSON:
+            return jsonify(valid=False, error="payload_too_large",
+                           max_bytes=_MAX_JSON, got=len(raw)), 413
+        text = raw
+    else:
+        # Fetch the URL and validate the response body.
+        try:
+            url = _normalize_url(url)
+        except ValueError as e:
+            return jsonify(error=str(e)), 400
+        try:
+            _final, html_text, hdrs = _fetch(url, timeout=10)
+        except _FETCH_EXC as e:
+            return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+        ctype = (hdrs.get("Content-Type") or "").lower()
+        if "json" not in ctype:
+            return jsonify(url=url, valid=False,
+                           error="not_json_content_type", content_type=ctype), 422
+        if len(html_text.encode("utf-8", "ignore")) > _MAX_JSON:
+            return jsonify(url=url, valid=False, error="payload_too_large",
+                           max_bytes=_MAX_JSON), 413
+        text = html_text
+        source = url
+
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError) as e:
+        record_billing(g.meter_key, g.plan, "json-validate:invalid")
+        return jsonify(valid=False, source=source,
+                       size_bytes=len(text.encode("utf-8", "ignore")),
+                       error="invalid_json: %s" % str(e)[:200]), 422
+
+    out = {
+        "valid": True,
+        "source": source,
+        "size_bytes": len(text.encode("utf-8", "ignore")),
+        "type": type(parsed).__name__,
+    }
+    if isinstance(parsed, dict):
+        out["keys"] = sorted(parsed.keys())[:100]
+        out["key_count"] = len(parsed)
+    elif isinstance(parsed, list):
+        out["length"] = len(parsed)
+        # Sample the type of the first element to hint at list shape.
+        if parsed:
+            out["first_element_type"] = type(parsed[0]).__name__
+    record_billing(g.meter_key, g.plan, "json-validate:ok")
+    out["quota"] = quota_echo(g)
+    return jsonify(out)
+
+
+# ============================================================================
+# /api/social-embed (1.9.2) — single-call "ready-to-paste" embed bundle.
+# ============================================================================
+# Combines OpenGraph, Twitter Card, and favicon into one consumer-facing dict
+# suitable for link-card / chat-preview UIs. Saves a client from calling
+# /api/opengraph + /api/meta-tags + /api/favicons and stitching the result.
+@app.route("/api/social-embed")
+@rate_limit(app)
+def api_social_embed():
+    """Build a single 'ready-to-paste' social embed object for a URL.
+
+    Query: ?url=https://...   (required)
+
+    Returns: url, title, description, image, site_name, favicon, plus
+    ``cards`` (twitter:card / twitter:title / twitter:description /
+    twitter:image when present) and a ``best_image`` (twitter:image preferred
+    over og:image for higher-res social crops). All field sources are the page
+    meta tags; no fetches beyond the single HTML pull. 400 on bad URL, 502 on
+    fetch failure.  Mirrors /api/opengraph metering + quota echo.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    try:
+        # collect_body=True so the result includes the full 'meta' dict
+        # (parser.meta holds twitter:* + og:*); without it the Twitter Card
+        # fields would all resolve to empty strings.
+        out = preview_link(url, collect_body=True)
+    except _FETCH_EXC as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+
+    meta = out.get("meta", {})
+    cards = {
+        "twitter:card": meta.get("twitter:card", ""),
+        "twitter:title": meta.get("twitter:title", ""),
+        "twitter:description": meta.get("twitter:description", ""),
+        "twitter:image": meta.get("twitter:image", ""),
+    }
+    # Prefer twitter:image when present (often higher-res than og:image).
+    best_image = cards["twitter:image"] or out.get("image", "")
+    if best_image:
+        best_image = urljoin(out.get("url", ""), best_image)
+    if cards["twitter:image"]:
+        cards["twitter:image"] = urljoin(out.get("url", ""),
+                                         cards["twitter:image"])
+    bundle = {
+        "url": out.get("url", ""),
+        "title": _clean(out.get("title", "")),
+        "description": _clean(out.get("description", "")),
+        "image": best_image,
+        "site_name": _clean(out.get("site_name", "")),
+        "favicon": out.get("favicon", ""),
+        "cards": cards,
+        "source": "meta",
+    }
+    bundle["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "social-embed:%s" % url[:150])
+    return jsonify(bundle)
 
 
 if __name__ == "__main__":

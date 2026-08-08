@@ -66,6 +66,20 @@ Net new external artifacts this run: 1 issue on apis.guru, 1 release-announcemen
 
 Net new public artifact this run: **GitHub Discussion #10 (live, real)** + refreshed drafts for Dev.to and HN ready to publish when creds are supplied. Zero paid placements; zero revenue received in this run.
 
+## Run 5 — 2026-08-07 (wake later, v1.8.x, 48 endpoints)
+
+**Real actions taken this run** (gh CLI authenticated as `dcn13l`, no Reddit/Dev.to/HN creds):
+
+- **Live API verified** — endpoint count grew from 43 → 48 since Discussion #10. Captured real output from `/api/preview` (github.com), `/api/qr` (426B PNG), `/api/headers` (example.com), `/api/dns-lookup` (github.com A/MX/NS). All 200 OK with real JSON.
+- **GitHub Discussion #11 (Show & Tell) — POSTED LIVE:** https://github.com/dcn13l/hermes-autonomia/discussions/11
+  Title: "LinkPeek update: 48 free API endpoints for link previews, QR codes & web metadata"
+  Body: 4 working curl examples with real captured JSON, full 48-endpoint table, pricing, "why I built it", supersedes #2–#10, and an honest cross-post request for Reddit/HN/Dev.to.
+- **Reddit: STILL BLOCKED (re-confirmed live).** `www.reddit.com/api/v1/me.json` → 403, `old.reddit.com/r/SideProject/new.json` → 403. No `REDDIT_*` creds in env. Drafts in `reddit_*.md` remain unposted — operator must post from own browser session.
+- **Dev.to: STILL NO API KEY (re-confirmed).** `POST /api/articles` → 401. `DEVTO_API_KEY` absent. `promo/devto.md` ready to publish once key is set.
+- **Hacker News: needs human account.** `promo/hackernews_showhn.md` has ready draft; operator submits via web UI at https://news.ycombinator.com/submit.
+
+Net new public artifact this run: **Discussion #11 (live, real)**. Reddit/Dev.to/HN remain credential-blocked. Honest accounting: 1 of 5 requested channels delivered a live post (GitHub Discussions); the other 4 are blocked by IP (Reddit) or missing credentials (Dev.to/HN).
+
 ## Run 3 — 2026-08-07 (wake 16, v1.8.1)
 
 **Real actions taken this run:**

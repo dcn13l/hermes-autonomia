@@ -6,6 +6,7 @@ Single Flask app. Endpoints:
     GET  /                     homepage (serves ./index.html)
     GET  /api/preview          metered link-preview extraction
     GET  /api/extract          raw meta + links + headings (deeper crawl)
+    GET  /api/metadata         combined preview + response headers (one call)
     GET  /api/metadata-full    full metadata dump (every meta tag)
     GET  /api/batch            up to 5 URLs at once (parallel fetch)
     GET  /api/screenshot-url-hint  returns a suggestion / strong hint for a
@@ -96,7 +97,7 @@ _FETCH_EXC = (
 )
 
 # Service metadata for /api/status
-__version__ = "1.9.0"
+__version__ = "1.9.1"
 _START_TIME = time.time()
 
 
@@ -642,6 +643,121 @@ def api_metadata_full():
     }
     out["quota"] = quota_echo(g)
     record_billing(g.meter_key, g.plan, url[:200])
+    return jsonify(out)
+
+
+# ============================================================================
+# /api/metadata — combined preview + response headers in one round trip.
+# Saves clients two calls (preview + headers) when they need both the parsed
+# link-card fields AND the raw HTTP response headers (Content-Type, Server,
+# Last-Modified, status, ...). Reuses preview_link + a headers-only probe.
+# ============================================================================
+@app.route("/api/metadata")
+@rate_limit(app)
+def api_metadata():
+    """Combined link-preview + response-headers view in a single JSON payload.
+
+    Query: ?url=https://...  (required)
+
+    Returns the four keys a link-card builder plus a cache/SEO auditor need
+    in one round trip:
+      * preview — the same dict /api/preview returns (title, description,
+        image, site_name, favicon, url)
+      * headers — final_url, status, headers{} (same shape as /api/headers)
+      * content_type — parsed (mime, charset) for convenience
+      * quota
+
+    One network round trip fetches HTML for the preview; the headers come
+    from the same fetch (no second request), so this is no slower than
+    /api/preview alone. 400 on a missing/bad URL, 502 on fetch failure.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    try:
+        # preview_link re-fetches via _fetch internally; we also need the
+        # raw headers, so do one _fetch here and reuse it for both. This
+        # keeps the endpoint to a single outbound request.
+        final_url, html_text, headers = _fetch(url)
+    except _FETCH_EXC as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+    # Build the preview from the already-fetched HTML (no second fetch).
+    head_html = _extract_head(html_text)
+    parser = _PeekParser(final_url)
+    try:
+        parser.feed(head_html)
+    except AssertionError:
+        pass
+    title = _clean(parser.title)
+    description = _clean(
+        parser.meta.get("description")
+        or parser.meta.get("og:description")
+        or parser.meta.get("twitter:description")
+    )
+    og_title = _clean(parser.meta.get("og:title") or parser.meta.get("twitter:title"))
+    if not title:
+        title = og_title
+    image = parser.meta.get("og:image") or parser.meta.get("twitter:image") or ""
+    if image:
+        image = urljoin(final_url, image)
+    site_name = _clean(parser.meta.get("og:site_name")) or ""
+    favicon = parser.favicon or ""
+    if not favicon or favicon.startswith("data:"):
+        parts = urlsplit(final_url)
+        if parts.scheme and parts.netloc:
+            favicon = "{}://{}/favicon.ico".format(parts.scheme, parts.netloc)
+    status = 200
+    # _fetch swallowed HTTPError into the body when available; pull status
+    # via a headers-only probe so the caller sees the upstream status code.
+    try:
+        h_opener = build_opener(ProxyHandler())
+        h_req = Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; LinkPeek/1.0; +https://github.com/linkpeek)",
+                "Accept": "*/*;q=0.8",
+                "Accept-Encoding": "gzip, deflate",
+            },
+            method="GET",
+        )
+        h_resp = h_opener.open(h_req, timeout=8.0)
+        h_resp.read(1)
+        status = h_resp.getcode() or 200
+    except HTTPError as he:
+        status = he.code
+        try:
+            he.read(1)
+        except (OSError, AttributeError):
+            pass
+    except _FETCH_EXC:
+        pass  # status stays 200; preview is the primary payload
+    ctype_raw = (
+        headers.get("Content-Type") or headers.get("content-type") or ""
+    )
+    mime, charset = _parse_content_type(ctype_raw)
+    out = {
+        "url": final_url,
+        "preview": {
+            "url": final_url,
+            "title": title,
+            "description": description,
+            "image": image,
+            "site_name": site_name,
+            "favicon": favicon,
+        },
+        "headers": {
+            "final_url": final_url,
+            "status": status,
+            "headers": {k: v for k, v in headers.items()},
+        },
+        "content_type": {"mime": mime, "charset": charset},
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "metadata:%s" % url[:200])
     return jsonify(out)
 
 
@@ -3546,8 +3662,14 @@ def api_broken_links():
     except ValueError as e:
         return jsonify(error=str(e)), 400
 
-    limit = max(1, min(20, int(request.values.get("limit") or 10)))
-    head_timeout = max(1, min(8, int(request.values.get("timeout") or 4)))
+    try:
+        limit = max(1, min(20, int(request.values.get("limit") or 10)))
+    except (ValueError, TypeError):
+        limit = 10
+    try:
+        head_timeout = max(1, min(8, int(request.values.get("timeout") or 4)))
+    except (ValueError, TypeError):
+        head_timeout = 4
 
     # ── Fetch source page via existing _fetch ──────────────────────
     try:
@@ -3656,7 +3778,10 @@ def api_email_validate():
     email = (request.values.get("email") or "").strip()
     if not email:
         return jsonify(error="pass ?email=user@example.com"), 400
-    timeout = max(1, min(15, int(request.values.get("timeout") or 6)))
+    try:
+        timeout = max(1, min(15, int(request.values.get("timeout") or 6)))
+    except (ValueError, TypeError):
+        timeout = 6
 
     valid_syntax = bool(_EMAIL_RE.match(email))
     domain = ""
@@ -3722,8 +3847,14 @@ def api_screenshot():
     url = (request.values.get("url") or "").strip()
     if not url:
         return jsonify(error="pass ?url=https://..."), 400
-    timeout = max(5, min(30, int(request.values.get("timeout") or 15)))
-    width = max(320, min(2400, int(request.values.get("width") or 1200)))
+    try:
+        timeout = max(5, min(30, int(request.values.get("timeout") or 15)))
+    except (ValueError, TypeError):
+        timeout = 15
+    try:
+        width = max(320, min(2400, int(request.values.get("width") or 1200)))
+    except (ValueError, TypeError):
+        width = 1200
     try:
         url = _normalize_url(url)
     except ValueError as e:

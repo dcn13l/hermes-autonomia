@@ -1,194 +1,46 @@
 {
-  "lp_pro_tX2GcAh5vYqA4ikd4AC4rg": {
-    "email": "test-buyer@example.com",
+  "lp_pro_existing_unpaid": {
+    "email": "buyer@example.com",
     "plan": "pro",
-    "issued": "2026-08-06",
+    "issued": "2026-08-07",
     "expires_ts": 0,
     "paid": false,
     "source": "self_serve_subscribe"
   },
-  "lp_pro_xOT44_WHPBjs_g_GWXbQLQ": {
-    "email": "pro-test@example.com",
-    "plan": "pro",
-    "issued": "2026-08-06",
-    "expires_ts": 0,
-    "paid": false,
-    "source": "self_serve_subscribe"
+  "lp_trial_user": {
+    "email": "trial@example.com",
+    "plan": "trial",
+    "issued": "2026-08-07",
+    "expires": "2026-08-21",
+    "expires_ts": 1787359076,
+    "paid": false
   },
-  "lp_pro_fHW6auJmqQvk6HCQlCdzFQ": {
-    "email": "pro-real@example.com",
+  "lp_pro_VWAsXp7t3JxzWUs0fJ-S3g": {
+    "email": "verify-lp-1786150571@example.com",
     "plan": "pro",
-    "issued": "2026-08-06",
+    "issued": "2026-08-08",
     "expires_ts": 0,
-    "paid": false,
-    "source": "self_serve_subscribe"
+    "paid": true,
+    "source": "self_serve_subscribe",
+    "auto_activated": 1786150572.853917,
+    "activation_source": "paypal_webhook",
+    "activation_amount_usd": 5.0
   },
-  "lp_pro_o341II8VaDhQXlsUpAGnrg": {
-    "email": "ok@example.com",
+  "lp_pro_c9Ms0WKcOWvcy13_56C0ag": {
+    "email": "fresh-verify-1786150983@example.com",
     "plan": "pro",
-    "issued": "2026-08-06",
+    "issued": "2026-08-08",
     "expires_ts": 0,
-    "paid": false,
-    "source": "self_serve_subscribe"
+    "paid": true,
+    "source": "self_serve_subscribe",
+    "auto_activated": 1786150985.248138,
+    "activation_source": "paypal_webhook",
+    "activation_amount_usd": 5.0
   },
-  "lp_pro_AhwkXH7krFuUyoWLh_TKAg": {
+  "lp_pro_N-gjoYtpeC0kqFxpUFbS_A": {
     "email": "test@example.com",
     "plan": "pro",
-    "issued": "2026-08-06",
-    "expires_ts": 0,
-    "paid": false,
-    "source": "self_serve_subscribe"
-  },
-  "lp_UQb0NLrnz4sp5EC_ewBl_Q": {
-    "email": "you@example.com",
-    "plan": "trial",
-    "issued": "2026-08-06",
-    "expires": "2026-08-20",
-    "expires_ts": 1787191579
-  },
-  "lp_pro_BdiKNStfJkCPXQDnTyVErw": {
-    "email": "test-verify@example.com",
-    "plan": "pro",
-    "issued": "2026-08-06",
-    "expires_ts": 0,
-    "paid": false,
-    "source": "self_serve_subscribe"
-  },
-  "lp_s3SUS1qWAaHJ03TFfuqjjg": {
-    "email": "test@example.com",
-    "plan": "trial",
-    "issued": "2026-08-06",
-    "expires": "2026-08-20",
-    "expires_ts": 1787197203
-  },
-  "lp_1RDYF6ufo-YX5EHCeyrNbA": {
-    "email": "verify-test@example.com",
-    "plan": "trial",
-    "issued": "2026-08-06",
-    "expires": "2026-08-20",
-    "expires_ts": 1787198960
-  },
-  "lp_pro_jcJ37cZcDpt_1M_E0-Qtiw": {
-    "email": "verify@test.com",
-    "plan": "pro",
-    "issued": "2026-08-06",
-    "expires_ts": 0,
-    "paid": false,
-    "source": "self_serve_subscribe"
-  },
-  "lp_pro_SqHgBRKz-kqo-Qclx36xHA": {
-    "email": "verifytest@example.com",
-    "plan": "pro",
-    "issued": "2026-08-06",
-    "expires_ts": 0,
-    "paid": false,
-    "source": "self_serve_subscribe"
-  },
-  "lp_pro_xayTKkewPkC89oIiRLA62A": {
-    "email": "test-research@example.com",
-    "plan": "pro",
-    "issued": "2026-08-06",
-    "expires_ts": 0,
-    "paid": false,
-    "source": "self_serve_subscribe"
-  },
-  "lp_PAGfnvJIMMq9K0HqWtEwgw": {
-    "email": "test2@example.com",
-    "plan": "trial",
-    "issued": "2026-08-06",
-    "expires": "2026-08-20",
-    "expires_ts": 1787255619
-  },
-  "lp_RldxUbljZbjbrN8dhNSGDQ": {
-    "email": "test3@example.com",
-    "plan": "trial",
-    "issued": "2026-08-06",
-    "expires": "2026-08-27",
-    "expires_ts": 1787860590
-  },
-  "lp_O8w2l8wgiv4mRfTTPvH3Ig": {
-    "email": "verify@example.com",
-    "plan": "trial",
-    "issued": "2026-08-06",
-    "expires": "2026-08-27",
-    "expires_ts": 1787860823
-  },
-  "lp_pro_hF6NX-40CBG1mB5GW2LzDA": {
-    "email": "eth@example.com",
-    "plan": "pro",
-    "issued": "2026-08-06",
-    "expires_ts": 0,
-    "paid": false,
-    "source": "self_serve_subscribe"
-  },
-  "lp_pro_GysXJewqEiY0KqsjvYCz1A": {
-    "email": "a@b.com",
-    "plan": "pro",
-    "issued": "2026-08-06",
-    "expires_ts": 0,
-    "paid": false,
-    "source": "self_serve_subscribe"
-  },
-  "lp_pro_9rwSrCsqCQ9F4j5PJgG9ew": {
-    "email": "alice@example.com",
-    "plan": "pro",
-    "issued": "2026-08-06",
-    "expires_ts": 0,
-    "paid": false,
-    "source": "self_serve_subscribe"
-  },
-  "lp_pro_RSvvcDm8jAAm6jnBqrWhAw": {
-    "email": "bob@example.com",
-    "plan": "pro",
-    "issued": "2026-08-06",
-    "expires_ts": 0,
-    "paid": false,
-    "source": "self_serve_subscribe"
-  },
-  "lp_pro_Kut2Bb8e-204qjqPhgW-PQ": {
-    "email": "verify@example.com",
-    "plan": "pro",
-    "issued": "2026-08-07",
-    "expires_ts": 0,
-    "paid": false,
-    "source": "self_serve_subscribe"
-  },
-  "lp_pro_7An6y6I_AS-CqeDltcT6bQ": {
-    "email": "verify2@example.com",
-    "plan": "pro",
-    "issued": "2026-08-07",
-    "expires_ts": 0,
-    "paid": false,
-    "source": "self_serve_subscribe"
-  },
-  "lp_pro_yz7M9QeBzfW244VIbACfGg": {
-    "email": "a@b.co",
-    "plan": "pro",
-    "issued": "2026-08-07",
-    "expires_ts": 0,
-    "paid": false,
-    "source": "self_serve_subscribe"
-  },
-  "lp_pro_NXRhYaEYDQKGevtiQRWDGw": {
-    "email": "c@d.co",
-    "plan": "pro",
-    "issued": "2026-08-07",
-    "expires_ts": 0,
-    "paid": false,
-    "source": "self_serve_subscribe"
-  },
-  "lp_pro_m9RZIYAEQU5vfy0e-B57-w": {
-    "email": "test@test.com",
-    "plan": "pro",
-    "issued": "2026-08-07",
-    "expires_ts": 0,
-    "paid": false,
-    "source": "self_serve_subscribe"
-  },
-  "lp_pro_kiwI_VTurXtzue8Q8Tycew": {
-    "email": "test2@test.com",
-    "plan": "pro",
-    "issued": "2026-08-07",
+    "issued": "2026-08-08",
     "expires_ts": 0,
     "paid": false,
     "source": "self_serve_subscribe"

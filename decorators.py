@@ -26,13 +26,19 @@ Live end-to-end path (verified 2026-08-07):
   paypal.com/paypalme/linkpeekpro). The landing-page button (index.html
   #pp-paypal) was a REPLACE_HANDLE placeholder; now points at the same URL.
 
+  QUOTA GATES ON paid==true (fixed 2026-08-07 — was a revenue leak):
+     - A Pro key is issued at signup but starts at the FREE daily limit
+       (100/day) until the operator flips paid:false → paid:true.
+     - Trial keys (14-day) inherit Pro limits until they expire; they never
+       carry a `paid` flag and are not affected by reconciliation.
+     - This closes the leak where all 19 pro keys in keys.json were
+       marked paid:false yet enjoyed the full 50,000/day Pro quota.
+
   RECONCILIATION (cron can't do this — human does):
      - PayPal notifies you per transaction; the buyer's email is your key.
      - Match the email to a key in keys.json  (grep keys.json for the email).
-     - Flip that key's `paid: false` → `paid: true` for your own accounting.
-     - NOTE: quota is NOT gated on paid==true. The Pro key works at full
-       50,000/day immediately on signup. We chose volume + trust over a
-       paywall that suppresses conversion (see subscribe() docstring).
+     - Flip that key's `paid: false` → `paid: true` to ACTIVATE Pro quota.
+       Until then the key works, but only at the Free 100/day limit.
 
   UPGRADE PATHS (env knobs, all $0 fixed cost):
      LINKPEEK_NOWPAYMENTS_KEY   → crypto accepted (USDC/ETH/BTC, +60 coins)
@@ -44,7 +50,11 @@ Live end-to-end path (verified 2026-08-07):
 Tier model (matches the live product site):
     - Free    : 100 requests/day, no key.  Metered per remote IP.
     - Pro/$5  : 50,000 requests/day, API key required.  Key-tier wins over IP tier.
-    - Trial   : 14-day trial key, treated as Pro until expiry.
+                Quota only unlocks when the key's `paid` flag is true; an
+                unpaid Pro key is held at the Free limit (effectively Free)
+                until reconciliation.
+    - Trial   : 14-day trial key, treated as Pro until expiry (never carries a
+                `paid` flag).
 
 Metering key = ("ip:<addr>", "ip:<addr>" for the free tier) so a user on a
 shared NAT still gets a fair per-IP allowance, and a key-holder is never
@@ -290,19 +300,19 @@ def subscribe(email: str, host: str = "") -> dict:
         )
         pay_method = "manual_email"
 
+    # The Pro key is issued immediately and works right away, but at the
+    # FREE 100/day limit. Pro quota (50k/day) only unlocks after the
+    # operator flips paid:true (matching the buyer's email to a payment
+    # notification). This is the gate that was previously missing — an
+    # unpaid key used to inherit full Pro quota, so nothing forced payment.
     return {
         "email": email,
         "api_key": api_key,
         "plan": "pro",
-        # The Pro key is already fully active at the Pro daily limit — the
-        # metering layer grants Pro quota on plan=="pro" regardless of the
-        # `paid` flag, so there is no real "pending" gate to wait behind.
-        # Telling buyers their key is "pending_activation" suppressed
-        # conversion (they thought they were limited until a human acted).
-        # Honesty sells: the key works NOW at full Pro quota.
-        "status": "active",
-        "paid": False,  # operator still reconciles the $5 for accounting; quota is not gated on it
+        "status": "pending_payment",  # active key, Free-tier quota until paid
+        "paid": False,
         "daily_limit": PRO_DAILY_LIMIT,
+        "current_effective_limit": FREE_DAILY_LIMIT,
         "price_usd": PRO_PRICE_USD,
         "billing_cycle": "month",
         "currency": "USD",
@@ -310,10 +320,10 @@ def subscribe(email: str, host: str = "") -> dict:
         "pay_method": pay_method,
         "pay_meta": pay_meta,  # invoice_id, pay_address, accepted_coins (crypto)
         "next_steps": [
-            "1. Your Pro key is live NOW — it already works at {:,} requests/day.".format(PRO_DAILY_LIMIT),
-            "2. Open pay_url and pay ${:.0f} to keep it after this billing cycle.".format(PRO_PRICE_USD),
-            "3. No manual activation step — your key never gets throttled while paid is pending.",
-            "4. Keep your key safe; it never expires while subscribed.",
+            "1. Your Pro key is live NOW but held at {} requests/day until payment is confirmed.".format(FREE_DAILY_LIMIT),
+            "2. Open pay_url and pay ${:.0f}. PayPal notifies the operator (keyed on your email).".format(PRO_PRICE_USD),
+            "3. Once reconciled, your key jumps to {:,} requests/day — no re-issue needed.".format(PRO_DAILY_LIMIT),
+            "4. Questions? Your key status is always at GET /api/validate-key?key={}.".format(api_key),
         ],
         "pricing": plan_catalog(),
     }
@@ -385,18 +395,55 @@ def _key_info(apikey: str) -> dict | None:
     return info
 
 
+def _effective_plan(info: dict | None) -> str:
+    """The tier actually enforced for quota purposes.
+
+    Rules (single source of truth — used by both key_status and rate_limit):
+      * No key / unknown key          → "free"   (100/day, per-IP metering)
+      * plan == "trial"               → "pro"   (50k/day until it expires;
+                                                 trials never carry `paid`)
+      * plan == "pro" and paid is True → "pro"   (50k/day, reconciled)
+      * plan == "pro" and paid is False → "free" (100/day — paywall held
+                                                 until the operator flips
+                                                 paid:true after payment)
+
+    This is the gate that closes the revenue leak: a self-serve Pro key used
+    to inherit full Pro quota at signup with paid:false, so nothing forced a
+    buyer to actually pay."""
+    if not info:
+        return "free"
+    plan = info.get("plan", "free")
+    if plan == "trial":
+        return "pro"
+    if plan == "pro":
+        return "pro" if info.get("paid") else "free"
+    return "free"
+
+
+def _plan_limit(plan: str) -> int:
+    """Daily limit for an effective plan name."""
+    return PRO_DAILY_LIMIT if plan == "pro" else FREE_DAILY_LIMIT
+
+
 def key_status(apikey: str) -> dict | None:
     """Public-facing key info for /api/validate-key. Returns plan, limits,
     expiry, and used-today count, or None when the key is unknown/expired.
-    Does NOT echo the email back (PII guard)."""
+    Does NOT echo the email back (PII guard).
+
+    ``plan`` reflects the stored plan (pro/trial/free); ``effective_plan`` is
+    the tier actually enforced for quota. They differ only for an unpaid Pro
+    key, whose effective_plan is "free" until paid:true."""
     info = _key_info(apikey)
     if not info:
         return None
-    plan = info.get("plan", "free")
-    limit = PRO_DAILY_LIMIT if plan in ("pro", "trial") else FREE_DAILY_LIMIT
+    stored_plan = info.get("plan", "free")
+    eff = _effective_plan(info)
+    limit = _plan_limit(eff)
     used = used_today("key:" + apikey)
     return {
-        "plan": plan,
+        "plan": stored_plan,
+        "effective_plan": eff,
+        "paid": bool(info.get("paid")),
         "valid": True,
         "issued": info.get("issued", ""),
         "expires": info.get("expires", ""),
@@ -516,11 +563,20 @@ def rate_limit(flask_app):
             ip = _client_ip(request)
             info = _key_info(apikey)
 
-            if info:  # key wins: pro/trial bucket
+            # Effective plan decides quota. An unpaid Pro key is held at the
+            # Free limit (revenue gate) but is STILL metered on its own
+            # "key:<apikey>" bucket so a signed-in unpaid user doesn't share
+            # the per-IP free allowance with everyone on their NAT.
+            eff = _effective_plan(info)
+            if eff == "pro":
                 plan = "pro"
                 limit = PRO_DAILY_LIMIT
                 meter_key = "key:" + apikey
-            else:  # free, per-IP bucket
+            elif info:  # unpaid Pro key → Free limit, key-scoped meter
+                plan = "free"
+                limit = FREE_DAILY_LIMIT
+                meter_key = "key:" + apikey
+            else:  # no key — anonymous free, per-IP bucket
                 plan = "free"
                 limit = FREE_DAILY_LIMIT
                 meter_key = "ip:" + ip

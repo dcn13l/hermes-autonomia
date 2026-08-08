@@ -1289,6 +1289,163 @@ def api_headers():
 
 
 # ============================================================================
+# /api/security-headers — fetch response headers and grade the security ones.
+# A dead-simple retention feature: many sites (and the developers building on
+# LinkPeek) want a one-call "is my site's HTTP security posture any good?"
+# that /api/headers alone can't answer (it returns raw headers without
+# analysis). This endpoint fetches once (same ProxyHandler/no-proxy path as
+# /api/headers), checks for the well-known security response headers, and
+# returns a present/missing verdict plus a 0-100 score. stdlib-only.
+# ============================================================================
+# Headers we inspect, ordered roughly by protective impact. Each entry maps to
+# a short human description surfaced in the response so a non-expert can act on
+# the verdict without consulting a separate doc.
+_SEC_HEADERS = (
+    ("strict-transport-security",
+     "HSTS", "Forces HTTPS and prevents SSL-stripping downgrade attacks."),
+    ("content-security-policy",
+     "CSP", "Mitigates XSS / data-injection by restricting resource sources."),
+    ("x-frame-options",
+     "X-Frame-Options", "Clickjacking guard (deny/sameorigin framing)."),
+    ("x-content-type-options",
+     "X-Content-Type-Options", "Stops MIME-sniffing (nosniff)."),
+    ("referrer-policy",
+     "Referrer-Policy", "Controls how much Referer leaks to third parties."),
+    ("permissions-policy",
+     "Permissions-Policy", "Locks down browser features (camera, geo, mics)."),
+    ("cross-origin-opener-policy",
+     "COOP", "Isolates browsing context — Spectre / cross-origin attack guard."),
+    ("cross-origin-embedder-policy",
+     "COEP", "Required for cross-origin isolation; blocks no-corb loads."),
+    ("cross-origin-resource-policy",
+     "CORP", "Restricts who can embed this resource cross-origin."),
+)
+# Weights sum to 1.0; HSTS + CSP carry the most weight since their absence is
+# the most consequential. Score = round(sum of met weights * 100).
+_SEC_WEIGHTS = {
+    "strict-transport-security": 0.20,
+    "content-security-policy": 0.20,
+    "x-frame-options": 0.15,
+    "x-content-type-options": 0.10,
+    "referrer-policy": 0.10,
+    "permissions-policy": 0.10,
+    "cross-origin-opener-policy": 0.05,
+    "cross-origin-embedder-policy": 0.05,
+    "cross-origin-resource-policy": 0.05,
+}
+
+
+@app.route("/api/security-headers")
+@rate_limit(app)
+def api_security_headers():
+    """Audit a URL's HTTP security response headers and score them 0-100.
+
+    Query: ?url=https://...  (required)
+
+    Does ONE fetch (a one-byte GET so the response headers materialize, like
+    /api/headers) and checks for the well-known security headers: HSTS, CSP,
+    X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy,
+    COOP/COEP/CORP. Returns each header's presence + raw value, a 0-100
+    weighted score, a grade (A-F), and a short advisory per missing header so
+    a non-expert developer can act immediately. 400 on a bad/missing URL,
+    502 on fetch failure.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+
+    opener = build_opener(ProxyHandler())
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; LinkPeek/1.0; +https://github.com/linkpeek)",
+            "Accept": "*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate",
+        },
+        method="GET",
+    )
+    final_url = url
+    status = 200
+    headers = {}
+    https = urlsplit(url).scheme.lower() == "https"
+    try:
+        resp = opener.open(req, timeout=8.0)
+        _ = resp.read(1)  # trigger the response headers (no body needed)
+        final_url = resp.geturl()
+        status = resp.getcode() or 200
+        headers = {k.lower(): v for k, v in resp.headers.items()}
+    except HTTPError as e:
+        final_url = e.url or url
+        status = e.code
+        headers = {k.lower(): v for k, v in (e.headers or {}).items()}
+        try:
+            e.read(1)
+        except (OSError, AttributeError):
+            pass
+    except _FETCH_EXC as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+
+    checks = []
+    score = 0.0
+    for hdr, short, desc in _SEC_HEADERS:
+        value = headers.get(hdr)
+        present = value is not None and value != ""
+        if present:
+            score += _SEC_WEIGHTS.get(hdr, 0.0)
+        # HSTS only counts on https:// — an http:// URL can never send it,
+        # so we don't penalise absence there (avoids a misleading low score
+        # for a site that simply wasn't probed over TLS).
+        if hdr == "strict-transport-security" and not https:
+            note = "N/A over http:// (HSTS only applies to HTTPS responses)."
+        elif not present:
+            note = "MISSING — " + desc
+        else:
+            note = "present"
+        checks.append({
+            "header": hdr,
+            "label": short,
+            "present": present,
+            "value": value or "",
+            "advice": note,
+        })
+
+    # HSTS is only meaningful on HTTPS; drop its weight from the denominator
+    # when scoring an http:// URL so the score isn't artificially deflated.
+    max_score = 1.0 if https else (1.0 - _SEC_WEIGHTS["strict-transport-security"])
+    score_pct = round((score / max_score) * 100) if max_score else 0
+    if score_pct >= 90:
+        grade = "A"
+    elif score_pct >= 75:
+        grade = "B"
+    elif score_pct >= 60:
+        grade = "C"
+    elif score_pct >= 40:
+        grade = "D"
+    else:
+        grade = "F"
+
+    out = {
+        "url": final_url,
+        "status": status,
+        "scheme": "https" if https else "http",
+        "score": score_pct,
+        "grade": grade,
+        "checks": checks,
+        "missing_count": sum(1 for c in checks if not c["present"]
+                             and not c["advice"].startswith("N/A")),
+        "summary": ("HTTPS security posture audit based on response headers. "
+                    "See /api/headers for the raw header dump."),
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "security-headers:%s" % url[:150])
+    return jsonify(out)
+
+
+# ============================================================================
 # oEmbed provider endpoint (oembed.com spec) — link-card-friendly JSON
 # ============================================================================
 @app.route("/api/oembed")
@@ -3700,20 +3857,45 @@ def api_broken_links():
         return jsonify(broken_links=[], broken_count=0, checked_count=0,
                        quota=quota_echo(g))
 
-    # ── Parallel HEAD checks ─────────────────────────────────────
+    # ── Parallel HEAD checks (with GET fallback) ────────────────
+    # Some servers/CDNs reject HEAD with 405 or 501 even though the resource
+    # exists and a GET would return 200. Treating those as "broken" silently
+    # produces false positives — the headline failure mode of this endpoint.
+    # Fix: on 405/501 (and 502 HEAD-only quirks on some app servers), retry
+    # with a GET that reads exactly 1 byte so the link is graded on its real
+    # status, not the server's dislike of HEAD.
     _UA = "Mozilla/5.0 (compatible; LinkPeek/1.0; +https://github.com/linkpeek)"
+
     def _check(lk):
+        def _probe(method):
+            req = Request(lk, method=method, headers={"User-Agent": _UA})
+            r = opener.open(req, timeout=head_timeout)
+            code = r.getcode() or 200
+            r.read(1)  # drain a byte so headers/body are materialized
+            r.close()
+            return code
+
+        opener = build_opener(ProxyHandler())
         try:
-            opener = build_opener(ProxyHandler())
-            req = Request(lk, method="HEAD",
-                          headers={"User-Agent": _UA})
-            resp = opener.open(req, timeout=head_timeout)
-            status = resp.status
-            resp.close()
+            status = _probe("HEAD")
+            if status in (405, 501):
+                # HEAD not allowed — retry GET and grade on the real status.
+                status = _probe("GET")
             return {"url": lk, "status": status, "broken": status >= 400}
         except HTTPError as e:
-            return {"url": lk, "status": e.code,
-                    "broken": e.code >= 400, "error": e.reason}
+            status = e.code
+            if status in (405, 501):
+                # Server rejected HEAD; fall back to GET to avoid a false
+                # positive "broken" verdict on a resource that works fine.
+                try:
+                    status = _probe("GET")
+                    return {"url": lk, "status": status,
+                            "broken": status >= 400, "method": "GET"}
+                except HTTPError as ge:
+                    return {"url": lk, "status": ge.code,
+                            "broken": ge.code >= 400, "error": ge.reason}
+            return {"url": lk, "status": status,
+                    "broken": status >= 400, "error": e.reason}
         except _FETCH_EXC as e:
             return {"url": lk, "status": None, "broken": True,
                     "error": str(e)[:100]}

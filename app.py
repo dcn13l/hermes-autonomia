@@ -40,6 +40,9 @@ Single Flask app. Endpoints:
     GET  /api/wayback        Internet Archive Wayback Machine snapshot lookup
     GET  /api/perf-timing    server-side TTFB + download time + total bytes for a URL
     GET  /api/slugify        slugify a text string into a URL-safe slug
+    GET  /api/password-strength  analyze password complexity + suggestions
+    GET  /api/cron-parser    parse 5-field cron expr → description + next runs
+    GET  /api/qr-with-logo   QR code with embedded centred logo (PNG or base64)
     GET  /lp/<code>            302-redirect for a short code
 """
 
@@ -104,7 +107,7 @@ _FETCH_EXC = (
 )
 
 # Service metadata for /api/status
-__version__ = "1.13.0"
+__version__ = "1.15.0"
 _START_TIME = time.time()
 
 
@@ -3566,8 +3569,8 @@ def api_status():
     charset, server, last_modified, status_code), /api/ssl-info (TLS cert
     issuer/subject/expiry + protocol + cipher for an https URL).
     Registered endpoints total: see the ``endpoints`` array length in this
-    response (38 as of 1.8.5; the count is computed dynamically from the
-    Flask url_map so it never drifts from the actual route table).
+    response (the count is computed dynamically from the Flask url_map so it
+    never drifts from the actual route table).
     New in 1.7.1: /api/sitemap-parse (parses sitemap.xml URL → URLs+sub-sitemaps),
     /api/og-image-proxy (proxies the og:image bytes for a page, with a byte cap),
     decorators.py type-annotation corruption fix (``***`` -> ``str``).
@@ -5412,6 +5415,437 @@ def api_slugify():
     out["quota"] = quota_echo(g)
     record_billing(g.meter_key, g.plan, "slugify:%d" % len(text))
     return jsonify(out)
+
+
+# ============================================================================
+# /api/password-strength — analyze password complexity (1.15.0).
+# ============================================================================
+# Pure stdlib. Scores on length, character-class diversity (lower, upper,
+# digit, symbol), entropy estimate, common-password blacklist, and repeated
+# or sequential patterns. Returns a 0-100 score, a strength label, and a list
+# of actionable improvement suggestions. No network calls, no password storage
+# — the input is never persisted.
+_PWD_COMMON = frozenset([
+    "password", "123456", "12345678", "qwerty", "abc123", "111111", "123456789",
+    "12345", "1234567", "admin", "letmein", "welcome", "monkey", "dragon",
+    "master", "login", "princess", "football", "shadow", "sunshine", "trustno1",
+    "iloveyou", "000000", "password1", "123123", "654321", "superman", "qazwsx",
+    "michael", "baseball", "welcome1", "hello", "charlie", "donald", "passw0rd",
+    "123", "1234", "abc", "qwerty123", "1q2w3e4r", "letmein123",
+])
+_PWD_SYMBOL_RE = re.compile(r"[^a-zA-Z0-9]")
+_PWD_SEQ = {"abcdefghijklmnopqrstuvwxyz": 4, "0123456789": 4, "qwertyuiop": 4,
+            "asdfghjkl": 4, "zxcvbnm": 4}
+
+def _has_sequence(pw, min_len=4):
+    """True if pw contains a keyboard/alphabet run of >= min_len chars."""
+    low = pw.lower()
+    for seq, ml in _PWD_SEQ.items():
+        for i in range(len(seq) - ml + 1):
+            if seq[i:i + ml] in low:
+                return seq[i:i + ml]
+    return None
+
+@app.route("/api/password-strength")
+@rate_limit(app)
+def api_password_strength():
+    """Analyze password strength and return a score + improvement tips.
+
+    Query: ?password=…     (required; the password to analyze)
+    Optional: ?maxlen=128   reject passwords longer than this (1..4096)
+
+    Returns: password_length, score (0-100), strength (weak|fair|good|strong),
+    entropy_bits, character_classes: {lower,upper,digit,symbol}, has_sequence,
+    is_common, suggestions: [...]. 400 on a missing password.
+    The password value is never echoed back or stored.
+    """
+    pw = request.values.get("password") or ""
+    if not pw:
+        return jsonify(error="pass ?password=..."), 400
+    try:
+        maxlen = max(1, min(4096, int(request.values.get("maxlen") or 128)))
+    except (ValueError, TypeError):
+        maxlen = 128
+    if len(pw) > maxlen:
+        return jsonify(error="password_too_long", max=maxlen, got=len(pw)), 413
+
+    has_lower = bool(re.search(r"[a-z]", pw))
+    has_upper = bool(re.search(r"[A-Z]", pw))
+    has_digit = bool(re.search(r"[0-9]", pw))
+    has_symbol = bool(_PWD_SYMBOL_RE.search(pw))
+    classes = sum([has_lower, has_upper, has_digit, has_symbol])
+
+    import math
+    pool = 0
+    if has_lower:
+        pool += 26
+    if has_upper:
+        pool += 26
+    if has_digit:
+        pool += 10
+    if has_symbol:
+        pool += 32
+    entropy = round(len(pw) * math.log2(pool), 1) if pool else 0.0
+
+    seq = _has_sequence(pw)
+    is_common = pw.lower() in _PWD_COMMON or pw == "12345"
+
+    # Scoring: length + diversity + entropy - penalties
+    score = 0
+    if len(pw) >= 12:
+        score += 25
+    elif len(pw) >= 8:
+        score += 15
+    elif len(pw) >= 4:
+        score += 5
+    score += classes * 12
+    if entropy >= 60:
+        score += 20
+    elif entropy >= 36:
+        score += 12
+    elif entropy >= 20:
+        score += 5
+    if is_common:
+        score = min(score, 15)
+    if seq:
+        score -= 10
+    if len(set(pw)) <= 2 and len(pw) > 3:
+        score -= 15  # e.g. "aaaaaa", "ababab"
+    score = max(0, min(100, score))
+
+    if score < 40:
+        strength = "weak"
+    elif score < 60:
+        strength = "fair"
+    elif score < 80:
+        strength = "good"
+    else:
+        strength = "strong"
+
+    suggestions = []
+    if len(pw) < 12:
+        suggestions.append("Use at least 12 characters.")
+    if not has_upper:
+        suggestions.append("Add uppercase letters.")
+    if not has_lower:
+        suggestions.append("Add lowercase letters.")
+    if not has_digit:
+        suggestions.append("Add digits.")
+    if not has_symbol:
+        suggestions.append("Add symbols (!@#$…).")
+    if is_common:
+        suggestions.append("Avoid common passwords.")
+    if seq:
+        suggestions.append("Avoid sequences like '%s'." % seq)
+    if not suggestions:
+        suggestions.append("Strong password — looks good!")
+
+    out = {
+        "password_length": len(pw),
+        "score": score,
+        "strength": strength,
+        "entropy_bits": entropy,
+        "character_classes": {
+            "lower": has_lower,
+            "upper": has_upper,
+            "digit": has_digit,
+            "symbol": has_symbol,
+        },
+        "classes_count": classes,
+        "has_sequence": bool(seq),
+        "sequence": seq,
+        "is_common": is_common,
+        "unique_chars": len(set(pw)),
+        "suggestions": suggestions,
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "password-strength:%d" % len(pw))
+    return jsonify(out)
+
+
+# ============================================================================
+# /api/cron-parser — parse standard 5-field cron expressions (1.15.0).
+# ============================================================================
+# Converts a cron expression (* * * * *) into a human-readable description,
+# a structured field breakdown, and the next N run times. Pure stdlib —
+# uses datetime arithmetic, no external cron library.
+_CRON_ALIASES = {
+    "@yearly": "0 0 1 1 *",
+    "@annually": "0 0 1 1 *",
+    "@monthly": "0 0 1 * *",
+    "@weekly": "0 0 * * 0",
+    "@daily": "0 0 * * *",
+    "@midnight": "0 0 * * *",
+    "@hourly": "0 * * * *",
+}
+_CRON_FIELD_NAMES = ["minute", "hour", "day_of_month", "month", "day_of_week"]
+
+def _cron_parse_field(spec, lo, hi):
+    """Parse one cron field into a sorted list of valid ints. Supports * , - /."""
+    if spec == "*":
+        return list(range(lo, hi + 1))
+    values = set()
+    for part in spec.split(","):
+        step = 1
+        if "/" in part:
+            part, step_s = part.split("/", 1)
+            if not step_s.isdigit():
+                raise ValueError("invalid_step")
+            step = int(step_s)
+            if step == 0:
+                raise ValueError("zero_step")
+        if part == "*":
+            rlo, rhi = lo, hi
+        elif "-" in part:
+            a, b = part.split("-", 1)
+            rlo, rhi = int(a), int(b)
+        else:
+            rlo = rhi = int(part)
+        if rlo < lo or rhi > hi:
+            raise ValueError("out_of_range")
+        values.update(range(rlo, rhi + 1, step))
+    return sorted(values)
+
+def _cron_next_runs(field_sets, now, n=5, max_iter=525600):
+    """Compute the next n run datetimes starting from now (exclusive)."""
+    from datetime import timedelta
+    runs = []
+    cur = now.replace(second=0, microsecond=0)
+    count = 0
+    while count < n and max_iter > 0:
+        max_iter -= 1
+        cur = cur + timedelta(minutes=1)
+        mdow = (cur.weekday() + 1) % 7  # Mon=0→1 ... Sun=6→0
+        match = (cur.minute in field_sets[0] and
+                 cur.hour in field_sets[1] and
+                 cur.day in field_sets[2] and
+                 cur.month in field_sets[3] and
+                 mdow in field_sets[4])
+        if match:
+            runs.append(cur.isoformat())
+            count += 1
+    return runs
+
+@app.route("/api/cron-parser")
+@rate_limit(app)
+def api_cron_parser():
+    """Parse a standard 5-field cron expression into a description + next runs.
+
+    Query: ?expr=*/5 * * * *      (required; 5-field cron or @alias)
+    Optional: ?count=5            number of future run times to compute (1..20)
+    Optional: ?tz=UTC             timezone label for display only (no conversion)
+
+    Returns: expr, fields: {minute,hour,...} as arrays, human_readable (string),
+    next_runs: [ISO timestamps], alias (if an @preset was used). 400 on bad
+    syntax, 422 on out-of-range values.
+    """
+    import datetime
+    expr = (request.values.get("expr") or "").strip()
+    if not expr:
+        return jsonify(error="pass ?expr=5-field-cron-expr"), 400
+    try:
+        count = max(1, min(20, int(request.values.get("count") or 5)))
+    except (ValueError, TypeError):
+        count = 5
+    tz_label = (request.values.get("tz") or "UTC").strip()[:50]
+
+    alias_used = None
+    low = expr.lower()
+    if low in _CRON_ALIASES:
+        alias_used = low
+        expr = _CRON_ALIASES[low]
+
+    parts = expr.split()
+    if len(parts) != 5:
+        return jsonify(error="invalid_cron", detail="expected 5 whitespace-separated fields"), 422
+
+    ranges = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)]
+    field_sets = [None] * 5
+    try:
+        for i, (field, (lo, hi)) in enumerate(zip(parts, ranges)):
+            field_sets[i] = _cron_parse_field(field, lo, hi)
+    except ValueError as e:
+        return jsonify(error="invalid_cron", detail=str(e)), 422
+
+    _month_names = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    _dow_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    human = "At "
+    # minute
+    m = field_sets[0]
+    if m == list(range(60)):
+        human += "every minute"
+    else:
+        human += "minute %s" % ", ".join(str(x) for x in m[:10])
+        if len(m) > 10:
+            human += ", …"
+    # hour
+    h = field_sets[1]
+    if h == list(range(24)):
+        human += " of every hour"
+    else:
+        human += " of hour %s" % ", ".join(str(x) for x in h[:10])
+        if len(h) > 10:
+            human += ", …"
+    human += ","
+    # dom
+    d = field_sets[2]
+    if d == list(range(1, 32)):
+        human += " every day"
+    else:
+        human += " on day %s of the month" % ", ".join(str(x) for x in d[:10])
+        if len(d) > 10:
+            human += ", …"
+    # month
+    mo = field_sets[3]
+    if mo != list(range(1, 13)):
+        names = [_month_names[x] for x in mo if x < 13]
+        human += " in %s" % ", ".join(names[:6])
+    # dow
+    dw = field_sets[4]
+    if dw != list(range(7)) and dw != [0, 1, 2, 3, 4, 5, 6]:
+        names = [_dow_names[x] for x in dw if x < 7]
+        human += " on %s" % ", ".join(names[:7])
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        next_runs = _cron_next_runs(field_sets, now, n=count)
+    except Exception:
+        next_runs = []
+
+    out = {
+        "expr": " ".join(parts),
+        "alias": {"@preset": alias_used} if alias_used else None,
+        "fields": dict(zip(_CRON_FIELD_NAMES,
+                           [field_sets[i] for i in range(5)])),
+        "human_readable": human.strip(),
+        "next_runs": next_runs,
+        "timezone": tz_label,
+        "count": len(next_runs),
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "cron-parser:%s" % expr[:150])
+    return jsonify(out)
+
+
+# ============================================================================
+# /api/qr-with-logo — QR code with an embedded centred logo (1.15.0).
+# ============================================================================
+# Generates a QR code (ECC automatically raised to H so the logo doesn't
+# destroy readability) with an optional centred logo image overlaid. The
+# logo can be provided as a URL (?logo=) which is fetched, or omitted for a
+# plain high-ECC QR. Returns PNG bytes or JSON base64 via ?format=json.
+# Uses qrcode + Pillow; graceful 503 if Pillow is not installed.
+@app.route("/api/qr-with-logo")
+@rate_limit(app)
+def api_qr_with_logo():
+    """Generate a QR code with an optional centred logo overlay.
+
+    Query: ?text=…           (required; the data to encode)
+    Optional: ?logo=https://…   URL of a square PNG/JPEG logo to embed centred
+    Optional: ?size=20      QR box_size (default 20; 5..50)
+    Optional: ?ecc=h        error correction (forced to H when a logo is set)
+    Optional: ?fg=000000    foreground hex colour (default black)
+    Optional: ?bg=FFFFFF    background hex colour (default white)
+    Optional: ?format=png   png (raw image, default) or json (base64 envelope)
+    Optional: ?logo_ratio=20  logo size as % of QR width (1..40, default 20)
+
+    Returns: PNG image or JSON {ok, text, image: "data:image/png;base64,…"}.
+    400 on missing text, 413 if text > 2000 chars, 503 if Pillow unavailable.
+    """
+    text = (request.values.get("text") or "").strip()
+    if not text:
+        return jsonify(error="pass ?text=..."), 400
+    _QR_MAX_CHARS = 2000
+    if len(text) > _QR_MAX_CHARS:
+        return jsonify(error="text_too_long", max=_QR_MAX_CHARS, got=len(text)), 413
+
+    logo_url = (request.values.get("logo") or "").strip()
+    try:
+        box_size = max(5, min(50, int(request.values.get("size") or 20)))
+    except (ValueError, TypeError):
+        box_size = 20
+    try:
+        logo_ratio = max(1, min(40, int(request.values.get("logo_ratio") or 20)))
+    except (ValueError, TypeError):
+        logo_ratio = 20
+    fmt = (request.values.get("format") or "png").strip().lower()
+
+    def _hex(name, default):
+        v = (request.values.get(name) or "").strip().lstrip("#")
+        if not v or not re.match(r"^[0-9a-fA-F]{6}$", v):
+            return default
+        return "#" + v.lower()
+    fg = _hex("fg", "#000000")
+    bg = _hex("bg", "#ffffff")
+
+    try:
+        import qrcode
+        from io import BytesIO
+        from PIL import Image
+    except ImportError:
+        return jsonify(error="qrcode+Pillow required (not installed)"), 503
+
+    # Use high ECC when a logo is present to preserve readability.
+    ecc_level = qrcode.constants.ERROR_CORRECT_H if logo_url else \
+        qrcode.constants.ERROR_CORRECT_M
+    qr = qrcode.QRCode(version=None, error_correction=ecc_level,
+                        box_size=box_size, border=4)
+    qr.add_data(text)
+    qr.make(fit=True)
+
+    try:
+        img = qr.make_image(fill_color=fg, back_color=bg).convert("RGBA")
+    except Exception as exc:
+        return jsonify(error="qr_render_failed", detail=str(exc)[:200]), 503
+
+    # Embed logo if provided
+    if logo_url:
+        try:
+            from urllib.request import urlopen
+            logo_resp = urlopen(logo_url, timeout=6)
+            logo_bytes = logo_resp.read()
+            _LOGO_MAX = 512 * 1024  # 512 KiB cap
+            if len(logo_bytes) > _LOGO_MAX:
+                return jsonify(error="logo_too_large", max_bytes=_LOGO_MAX), 413
+            logo = Image.open(BytesIO(logo_bytes)).convert("RGBA")
+            # Compute logo size as a fraction of the QR width.
+            qr_w = img.size[0]
+            logo_w = int(qr_w * logo_ratio / 100)
+            logo_h = int(logo_w * (logo.size[1] / logo.size[0]))
+            logo_w = min(logo_w, qr_w // 3)
+            logo_h = min(logo_h, qr_w // 3)
+            if logo_w > 0 and logo_h > 0:
+                logo = logo.resize((logo_w, logo_h), Image.LANCZOS)
+                pos = ((qr_w - logo_w) // 2, (qr_w - logo_h) // 2)
+                img.paste(logo, pos, mask=logo if logo.mode == "RGBA" else None)
+        except Exception as exc:
+            return jsonify(error="logo_embed_failed",
+                           detail=str(exc)[:200]), 503
+
+    try:
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        png_data = buf.getvalue()
+    except Exception as exc:
+        return jsonify(error="qr_render_failed", detail=str(exc)[:200]), 503
+
+    record_billing(g.meter_key, g.plan, "qr-with-logo:%s" % text[:150])
+
+    if fmt == "json":
+        import base64
+        b64 = base64.b64encode(png_data).decode("ascii")
+        out = {
+            "ok": True,
+            "text": text,
+            "has_logo": bool(logo_url),
+            "size_bytes": len(png_data),
+            "image": "data:image/png;base64," + b64,
+        }
+        out["quota"] = quota_echo(g)
+        return jsonify(out)
+    return Response(png_data, mimetype="image/png")
 
 
 # ============================================================================

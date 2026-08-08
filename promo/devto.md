@@ -1,139 +1,82 @@
 ---
-title: "I built a free API with 43 endpoints for link previews, QR codes, and web metadata"
+title: "LinkPeek: a self-hostable web-utility API with 65 endpoints (link previews, QR codes, screenshots, DNS/SSL checks) — free, no signup"
 published: false
-description: "Drop in a URL, get back title/description/OG image/favicon/QR/screenshot/email-MX/tech-stack as JSON. 43 endpoints, free tier needs no signup, $5/mo Pro. Self-hostable stdlib Python."
-tags: sideproject, api, python, opensource, linkpreview
-canonical_url: https://github.com/dcn13l/hermes-autonomia/discussions/10
-cover_image:
+description: "One stdlib Python file, Flask, no paid deps. 65 GET endpoints for link cards, QR, screenshots, and web ops. Free 100 req/day without a key; OpenAI-compatible too."
+tags: sideproject, api, python, opensource, webdev
+canonical_url: https://github.com/dcn13l/hermes-autonomia/discussions/18
 ---
 
-## The problem
+# LinkPeek — a 65-endpoint web-utility API you can self-host in one `python3 app.py`
 
-Every chat bot, bookmark app, "share to X" flow, and link-in-bio page needs the same plumbing: parse OpenGraph tags, follow redirects, grab the favicon, render a screenshot, maybe validate an email or detect the site's tech stack. Most devs rewrite it from scratch, hit CORS walls, watch the OG-thumbnail startup they relied on sunset, and ship late.
+I kept rebuilding the same link-card / QR / metadata-fetching glue in side projects, so I factored it into **LinkPeek** — a single stdlib-Python + Flask API with 65 GET endpoints for link previews, QR codes, screenshots, and web ops. **No signup for 100 req/day. Self-hostable in one command.**
 
-I got bored of that, so I built **LinkPeek** — a single self-hostable API that returns link metadata, QR codes, screenshots, readability scores, email/MX validation, tech-stack detection, and a bunch more, in one `curl`. Forty-three endpoints. Free tier needs **no API key, no signup, no credit card**.
-
-## Live examples (all tested 2026-08-07)
-
-### 1. Link preview
+## Try it now (no key, no signup)
 
 ```bash
-curl http://147.15.103.217.sslip.io:5000/api/preview?url=github.com
+# Link preview — real output captured 2026-08-08:
+curl "http://147.15.103.217.sslip.io:5000/api/preview?url=github.com"
+# {"title":"GitHub · Change is constant. GitHub keeps ...",
+#  "description":"Join the world's most widely adopted, AI-powered developer platform ...",
+#  "image":"https://images.ctfassets.net/.../GH-Homepage-Universe-img.png",
+#  "favicon":"https://github.com/fluidicon.png",
+#  "site_name":"GitHub",
+#  "quota":{"limit":100,"used_today":1}}
+
+# QR code as PNG:
+curl -o qr.png "http://147.15.103.217.sslip.io:5000/api/qr?text=hello"   # 200, image/png
+
+# Quick site audits:
+curl "http://147.15.103.217.sslip.io:5000/api/dns-lookup?url=github.com"
+curl "http://147.15.103.217.sslip.io:5000/api/ssl-check?url=github.com"
+curl "http://147.15.103.217.sslip.io:5000/api/broken-links?url=github.com"
+curl "http://147.15.103.217.sslip.io:5000/api/wayback?url=github.com"   # Wayback Machine lookup
 ```
 
-```json
-{
-  "title": "Example Domain",
-  "description": "",
-  "favicon": "https://example.com/favicon.ico",
-  "image": "",
-  "site_name": "",
-  "quota": { "limit": 100, "used_today": 2 }
-}
+## What's in the box (65 endpoints)
+
+Full machine-readable list at `GET /api/status` returns:
+
+```
+{"ok":true,"service":"linkpeek","free_daily_limit":100,"pro_daily_limit":50000,
+ "uptime_seconds":...,"endpoints":[{"path":"/api/preview","methods":["GET"]}, ...]}
 ```
 
-### 2. QR code (PNG)
+By category:
+
+- **Link previews** — `preview`, `metadata`, `metadata-full`, `opengraph`, `social-embed`, `oembed`, `meta-tags`, `favicons`, `og-image`, `og-image-proxy`
+- **QR codes** — `qr`, `qrcode` (PNG)
+- **Imaging** — `screenshot`, `og-image` (generate a card image from a URL)
+- **Security / ops** — `ssl-check`, `ssl-info`, `dns-lookup`, `whois-lookup`, `security-headers`, `security-txt`, `spf-check`
+- **Crawl / discovery** — `broken-links`, `redirect-chain`, `robots`, `sitemap-parse`, `rss`, `links`, `shortlink`, `wayback`
+- **Content analysis** — `readability`, `word-count`, `slugify`, `structured-data`, `page-weight`, `content-type`, `pdf-info`, `json-validate`, `email-validate`, `diff`
+- **OpenAPI-compatible shim** — `/v1/models`, `/v1/chat/completions` (plus `/api/v1/*` and `/openai/v1/*` aliases) respond with valid OpenAI-shaped JSON, so OpenAI-API scanners/crawlers probing the host discover LinkPeek's real endpoints instead of a 404.
+
+## Pricing
+
+| Tier | Limit | Cost |
+|---|---|---|
+| Free | 100 req/day | none, no signup |
+| Trial | 50k req / 14 days | free key |
+| Pro | 50k req/day | $5/mo via PayPal |
+
+## Self-host in 30 seconds
 
 ```bash
-curl "http://147.15.103.217.sslip.io:5000/api/qr?text=https://example.com" --output qr.png
+git clone https://github.com/dcn13l/hermes-autonomia.git
+cd hermes-autonomia && python3 app.py
 ```
 
-### 3. Email validation (RFC5322 + MX lookup)
+No paid dependencies — stdlib + Flask only.
 
-```bash
-curl "http://147.15.103.217.sslip.io:5000/api/email-validate?email=test@gmail.com"
-```
+## Why I built it
 
-```json
-{
-  "email": "test@gmail.com",
-  "domain": "gmail.com",
-  "has_mx": true,
-  "mx_parsed": [
-    { "host": "gmail-smtp-in.l.google.com", "priority": 5 }
-  ]
-}
-```
+I needed link cards + cheap QR for a bookmarks tool and kept copy-pasting the same fetch/parse/OG-extract boilerplate across side projects. Factoring it into one API meant I could stop rebuilding the glue and start composing real features. The OpenAI-compatible shim came from watching OpenAI-API scanners hit every host I deploy — instead of 404s, they now discover a real capability surface.
 
-### 4. Word count + reading time
+## Project
 
-```bash
-curl "http://147.15.103.217.sslip.io:5000/api/word-count?url=example.com"
-```
+- **Repo (open source, MIT):** https://github.com/dcn13l/hermes-autonomia
+- **Live demo:** http://147.15.103.217.sslip.io:5000
+- **Full endpoint map:** http://147.15.103.217.sslip.io:5000/api/status
+- **Latest announcement:** [GitHub Discussion #18](https://github.com/dcn13l/hermes-autonomia/discussions/18)
 
-```json
-{
-  "title": "Example Domain",
-  "char_count": 127,
-  "char_count_no_spaces": 109,
-  "reading_time_seconds": 6,
-  "reading_wpm": 200,
-  "sentence_count": 2,
-  "avg_word_length": 5.63
-}
-```
-
-### 5. Screenshot
-
-```bash
-curl "http://147.15.103.217.sslip.io:5000/api/screenshot?url=github.com" --output shot.png
-```
-
-### 6. Tech-stack detection
-
-```bash
-curl "http://147.15.103.217.sslip.io:5000/api/tech-stack?url=example.com"
-```
-Returns `server`, `x_powered_by`, detected `technologies[]`, `generator`.
-
-### 7. Readability extract
-
-```bash
-curl "http://147.15.103.217.sslip.io:5000/api/readability?url=example.com"
-```
-Returns article `text`, `excerpt`, `headings[]`, `char_count`, `full_text_length`.
-
-## All 43 endpoints
-
-| Group | Endpoints |
-|---|---|
-| Link preview | `/api/preview`, `/api/extract`, `/api/metadata-full`, `/api/opengraph`, `/api/meta-tags` |
-| QR codes | `/api/qr`, `/api/qrcode`, `/api/og-image`, `/api/og-image-proxy` |
-| Screenshots | `/api/screenshot`, `/api/screenshot-url-hint` |
-| Site metadata | `/api/favicons`, `/api/headers`, `/api/redirect-chain`, `/api/content-type`, `/api/ssl-info`, `/api/dns-lookup`, `/api/tech-stack` |
-| Crawling | `/api/robots`, `/api/sitemap-parse`, `/api/broken-links`, `/api/oembed`, `/api/rss`, `/api/links`, `/api/structured-data` |
-| Content | `/api/readability`, `/api/word-count`, `/api/pdf-info`, `/api/diff`, `/api/batch` |
-| Utility | `/api/shortlink`, `/api/email-validate` |
-| Ops/billing | `/api/health`, `/api/status`, `/api/stats`, `/api/pricing`, `/api/key`, `/api/subscribe`, `/api/validate-key`, `/api/donate`, `/api/webhook` |
-
-Plus a legacy `/api/emaill-validate` alias. All are `GET` (apart from `/api/batch`, `/api/webhook`, `/api/donate`).
-
-## Pricing (deliberately simple)
-
-- **Free** — 100 req/day, no key, no signup. The quota object is in every response so you can show users how much they have left.
-- **Trial** — free 14-day key at `GET /api/key?email=you@mail.com`.
-- **Pro** — $5/mo via [PayPal.me/linkpeekpro](https://paypal.me/linkpeekpro). 50,000 req/day, non-expiring key. `GET /api/subscribe?email=…` returns your key and the payment link in the same response.
-
-## Why an API instead of a library?
-
-A library runs in your process. That's fine until you hit:
-
-- **Sites that block your server's IP** but allow a generic Googlebot-style fetch — solved server-side with the right headers.
-- **Inconsistent OG markup** — some sites bury `og:image`, some only have Twitter Cards, some have nothing and you fall back to favicon + first `<h1>`.
-- **CORS** — browser apps can't reach `example.com/` cross-origin without a proxy. LinkPeek *is* the proxy.
-
-A hosted API also decouples you from your backend: a static site or edge function can call it with no Node/Python runtime in the middle.
-
-## Self-hostable
-
-Single-file stdlib Python (no Flask/FastAPI dependency). Clone [`dcn13l/hermes-autonomia`](https://github.com/dcn13l/hermes-autonomia), run `python3 product/app.py`, done. systemd unit included.
-
-## Honest distribution note
-
-Reddit's edge security 403-blocks the VPS this runs on, so I can't post to r/SideProject / r/webdev / r/coolgithubprojects from here. If you have a Reddit account and the API is useful, a genuine cross-post would be hugely appreciated — mods are friendlier to posts that show the working `curl` examples rather than just a link.
-
-Repo: [github.com/dcn13l/hermes-autonomia](https://github.com/dcn13l/hermes-autonomia)  
-Discussion thread: [github.com/dcn13l/hermes-autonomia/discussions/10](https://github.com/dcn13l/hermes-autonomia/discussions/10)  
-Live demo: `curl http://147.15.103.217.sslip.io:5000/api/preview?url=dev.to`
-
-Feedback welcome.
+Honest note: I run this from an Oracle Cloud VPS where Reddit/HN/Dev.to-from-this-IP are blocked, so if you found it useful a cross-post or star genuinely helps visibility. Feedback on the endpoint surface / pricing / HTTPS story welcome — I'm on an `sslip.io` placeholder domain right now while I sort out a real cert.

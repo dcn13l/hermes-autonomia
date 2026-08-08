@@ -2,6 +2,8 @@
 
 ## Summary
 - **Reddit (r/coolgithubprojects + r/SideProject): BLOCKED.** www.reddit.com returns HTTP 403 to unauthenticated curl/`submit.json`; old.reddit.com/submit also 403. No Reddit credentials in env (`REDDIT_*` absent). Browser is Chromium via snap but agent-browser can't launch it (launcher path has embedded null byte → terminal guard fails). No HTTP path to an authenticated Reddit session from this environment. Drafts in this dir are not posted.
+
+> **Run 8 — 2026-08-08 (v1.14.0, 65 endpoints).** See "Run 8" entry below for the live artifacts and re-verification. Reddit/IndieHackers HTTP 403, Dev.to 401 (no key), HN no session, lobste.rs read-only — all re-confirmed live this run. New live distribution: **public GitHub Gist** https://gist.github.com/dcn13l/80be37673f3956e5b2e596dcab8c2bae (verified 200). Discussion #18 already covers the 65-endpoint milestone (verified substantive, not a placeholder) — no duplicate Discussion posted to avoid the spam-flag anti-pattern. All operator-ready drafts refreshed with verified-2026-08-08 curl output.
 - **Hacker News: BLOCKED (no login + low/zero karma).** reachable (200), but posting requires a logged-in browser session + account age/karma gating. Saved as a Show HN draft in `hackernews_comment.md` with a posting reality-check for the operator.
 - **Dev.to: NOT POSTED (no API key).** `DEVTO_API_KEY` env var not set (`/articles` POST gets 401). Full expanded post written to `devto.md` with frontmatter ready to publish via `curl -X POST https://dev.to/api/articles -H "api-key: $DEVTO_API_KEY" -d@devto.md` once the operator sets the key.
 - **Live API verified working.** `/api/preview?url=https://github.com` returns full JSON (title, description, og:image, favicon, site_name, quota object). `/api/qr?text=…` returns a 564-byte PNG (200 OK).
@@ -108,6 +110,61 @@ Net new public artifact this run: **Discussion #11 (live, real)**. Reddit/Dev.to
 Net new public artifacts: 2 GitHub Discussions (live), 1 README rewrite (pushed), 1 version-tagged bug-fix commit (pushed), repo-topic updates. Zero paid placements; zero revenue received. Verification: live endpoint answers from outside the VPS (`147.15.103.217.sslip.io:5000/api/health` returns 200 ok).
 
 ## Run 3 — Lessons
+
+1. **GH Discussions are a real distribution surface and posting them is free via `gh api`** — they index in GitHub search and land in the repo's right-rail. Earlier runs missed this.
+2. **README is the first-touch surface.** It was internal "autonomous-business" style for 15 wakes — until this run it was never user-facing. Bigger miss than any technical bug.
+3. **Product-dir is the canonical copy, the `~/hermes-autonomia` clone is downstream.** Both must stay in sync; the systemd service loads from the skill-dir product path, not the clone. Wake-16 run synchronized them after a multi-wake divergence.
+
+## Run 8 — 2026-08-08 (v1.14.0, 65 endpoints — covered by existing Discussion #18)
+
+**Reachability re-verified live this run (HTTP codes from this Oracle Cloud VPS):**
+
+| Channel | Status | HTTP | Notes |
+|---|---|---|---|
+| Reddit `www.reddit.com/api/v1/me.json` | BLOCKED | 403 | re-confirmed; same Oracle Cloud IP-block as ledger |
+| Reddit `old.reddit.com/api/v1/me.json` | BLOCKED | 403 | — |
+| IndieHackers `indiehackers.com/` | BLOCKED | 403 | new finding — same edge-block class; not in prior status |
+| Dev.to `dev.to/api/articles` | reachable | 200 | but `DEVTO_API_KEY` UNSET → POST returns 401 (write blocked) |
+| Dev.to `dev.to/enter` page | reachable | 200 | login wall only; fresh headless session can't reach editor (per skill pitfall) |
+| lobste.rs `lobste.rs/` | reachable | 200 | read-only; POST `/stories` -> 302 login redirect (invite-only to actually post — out of agent reach) |
+| Hacker News `news.ycombinator.com/` | reachable | 200 | but no user session; curl `/submit` => shadow-flag (no official posting API) |
+| GitHub `gh` CLI | ✅ authed as `dcn13l` | — | write path works |
+
+**Environment:** `DEVTO_API_KEY` UNSET, no `REDDIT_*` creds, no lobste.rs/HN/IndieHackers session cookies.
+
+**Live API verified (captured 2026-08-08, used as the source of truth for all draft copy — nothing invented):**
+- `GET /api/preview?url=github.com` -> real JSON: `{"title":"GitHub · Change is constant. GitHub keeps ...","description":"Join the world's most widely adopted, AI-powered developer platform ...","image":"https://images.ctfassets.net/.../GH-Homepage-Universe-img.png","favicon":"https://github.com/fluidicon.png","site_name":"GitHub","quota":{"limit":100,"used_today":1}}`
+- `GET /api/qr?text=hello` -> 200 `image/png` (real QR code PNG)
+- `GET /v1/models` (and `/api/v1/models`, `/openai/v1/models`) -> OpenAI-shaped `{"data":[{...4 capability "models"...}]}` JSON
+- `app.py` route count = **65 routes**, exactly matches live `GET /api/status` endpoint inventory. The "65 endpoints" claim is verified, not asserted.
+- Correct endpoint shape is `/api/preview?url=`, `/api/qr?text=` (NOT `/api/v1/...` for the real utilities — `/api/v1/*` is the OpenAI shim only).
+
+**Net new public artifact this run — public GitHub Gist (real distribution, search-indexed):**
+- **Gist:** https://gist.github.com/dcn13l/80be37673f3956e5b2e596dcab8c2bae  (verified HTTP 200)
+- "LinkPeek — self-hostable web-utility API: 65 free endpoints (link previews, QR codes, screenshots, DNS/SSL checks). No signup. Stdlib Python + Flask."
+- Uses the verified curl examples + the real captured preview JSON. Serves as the shareable cheatsheet/landing alongside the repo.
+
+**Existing Discussion #18 verified, NOT duplicated (anti-spam):**
+- Discussion #18 ("LinkPeek v1.14.0 — now OpenAI-API-compatible (65 endpoints, free + self-hostable)") already covers this exact milestone with a substantive body (live demo, curl, pricing tiers, self-host instructions). Verified via `gh api .../discussions/18 --jq '.body'` — real content, not a placeholder.
+- Per the skill's anti-spam pitfall (one Discussion per meaningful milestone, no near-duplicate rehashes), no new Discussion was posted for the 65-endpoint milestone. The Gist is the fresh amplifier.
+
+**Operator-ready drafts refreshed (verified 2026-08-08 copy in `promo/`):**
+| File | Target | One-command unblock |
+|---|---|---|
+| `reddit_sideproject.md` | r/SideProject | operator pastes at reddit.com/r/SideProject/submit from own logged-in browser (VPS is IP-blocked) |
+| `reddit_webdev.md` | r/webdev | operator pastes at reddit.com/r/webdev/submit from own browser |
+| `reddit_coolgithubprojects.md` | r/coolgithubprojects | operator pastes at reddit.com/r/coolgithubprojects/submit from own browser |
+| `devto.md` | Dev.to | `curl -X POST https://dev.to/api/articles -H "api-key: $DEVTO_API_KEY" -H "Content-Type: application/json" -d "$(jq -Rs '{article: .}' < promo/devto.md)` once `DEVTO_API_KEY` env is set |
+| `indiehackers.md` | IndieHackers | operator pastes at indiehackers.com/new-post from own browser (VPS is IP-blocked) |
+| `lobsters.md` | lobste.rs | operator pastes if they have/obtain an invite-only account (agent has no invite) |
+
+**Two new platform suggestions** (the requested fallback, since Reddit/IndieHackers/Dev.to/HN/lobste.rs are all credential- or IP-blocked from this host):
+1. **GitHub Sponsors / FUNDING.yml** — link the repo's sponsor button to PayPal.me/linkpeekpro; zero auth cost and lands on every repo page + GitHub search for sponsored OSS.
+2. **The `awesome-*` curated-list repos** (e.g. `awesome-rest`, `awesome-apis`, `awesome-python` via a PR adding LinkPeek under a relevant section) — indexable, maintainer-curated, reachable from `gh` (no IP block), the same reachability class that made the Gist work.
+
+**Honest accounting:** 0/3 requested Reddit subreddits could be posted (IP-blocked, confirmed 403). 0/3 named alternatives could be posted this run (Dev.to 401 without key, lobste.rs read-only, IndieHackers 403). The only non-blocked write path from this host is the `gh` token — used it to ship a fresh **public Gist** (live, verified 200) as real distribution and the operator-ready drafts above to unblock the rest one-command-at-a-time. The 65-endpoint Discussion (#18) was already live from a prior run and was verified rather than re-posted. Nothing invented — all curl output in every artifact was captured live this run.
+
+## Run 3 — Lessons (original, preserved)
 
 1. **GH Discussions are a real distribution surface and posting them is free via `gh api`** — they index in GitHub search and land in the repo's right-rail. Earlier runs missed this.
 2. **README is the first-touch surface.** It was internal "autonomous-business" style for 15 wakes — until this run it was never user-facing. Bigger miss than any technical bug.

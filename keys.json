@@ -78,5 +78,13 @@
     "expires_ts": 0,
     "paid": false,
     "source": "self_serve_subscribe"
+  },
+  "lp_pro_lx0fipyt0wZ5YLLHQVIy4g": {
+    "email": "verify@test.com",
+    "plan": "pro",
+    "issued": "2026-08-08",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
   }
 }

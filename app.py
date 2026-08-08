@@ -43,6 +43,8 @@ Single Flask app. Endpoints:
     GET  /api/password-strength  analyze password complexity + suggestions
     GET  /api/cron-parser    parse 5-field cron expr → description + next runs
     GET  /api/qr-with-logo   QR code with embedded centred logo (PNG or base64)
+    GET  /api/hash-text      compute md5/sha1/sha256/sha512 hashes for ?text=
+    GET  /api/uuid           generate v1/v4/v5 UUIDs (?count=, ?namespace=, ?name=)
     GET  /lp/<code>            302-redirect for a short code
 """
 
@@ -107,7 +109,7 @@ _FETCH_EXC = (
 )
 
 # Service metadata for /api/status
-__version__ = "1.15.0"
+__version__ = "1.16.0"
 _START_TIME = time.time()
 
 
@@ -5949,6 +5951,117 @@ def openai_chat_completions():
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
     return jsonify(completion)
+
+
+# ============================================================================
+# /api/hash-text — compute cryptographic hashes for arbitrary text (1.16.0).
+# ============================================================================
+# Pure stdlib (hashlib). Returns md5, sha1, sha256 and sha512 hex digests in
+# a single call so callers don't have to make one request per algorithm.
+# Also includes the input length and the raw byte length (UTF-8 encoded).
+@app.route("/api/hash-text")
+@rate_limit(app)
+def api_hash_text():
+    """Compute cryptographic hashes for arbitrary text.
+
+    Query: ?text=<any string>   (required; the text to hash)
+    Optional: ?algo=md5|sha1|sha256|sha512   pick a single algorithm; if
+              omitted (or "all") every supported algorithm is returned.
+
+    Returns: text (echoed, truncated to 200 chars for the response), length
+    (char count), byte_length (UTF-8), hashes: {md5, sha1, sha256, sha512}
+    as lowercase hex strings. 400 on missing ?text=.
+    """
+    import hashlib
+    text = request.values.get("text")
+    if text is None:
+        return jsonify(error="pass ?text=<string>"), 400
+    algo = (request.values.get("algo") or "all").strip().lower()
+    supported = ("md5", "sha1", "sha256", "sha512")
+    if algo not in supported and algo != "all":
+        return jsonify(error="unsupported_algorithm",
+                       detail="algo must be one of %s or 'all'" %
+                              ", ".join(supported)), 400
+
+    data = text.encode("utf-8", errors="replace")
+    wanted = supported if algo == "all" else (algo,)
+    hashes = {a: hashlib.new(a, data).hexdigest() for a in wanted}
+    out = {
+        "text": text if len(text) <= 200 else text[:200] + "…",
+        "length": len(text),
+        "byte_length": len(data),
+        "hashes": hashes,
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "hash-text:%d" % min(len(data), 150))
+    return jsonify(out)
+
+
+# ============================================================================
+# /api/uuid — generate one or more UUIDs (1.16.0).
+# ============================================================================
+# Pure stdlib (uuid). Generates v1 (time+MAC), v4 (random), and v5
+# (namespace+name) UUIDs. Useful for IDs, test fixtures, primary keys.
+@app.route("/api/uuid")
+@rate_limit(app)
+def api_uuid():
+    """Generate one or more UUIDs.
+
+    Optional: ?version=v4            v1, v4, or v5 (default v4)
+    Optional: ?count=10              how many to generate (1..1000)
+    Optional: ?namespace=dns:...    namespace for v5 (dns/url/oid/..., or a
+                                     full UUID string)
+    Optional: ?name=<string>        name for v5 (required when version=v5)
+
+    Returns: version, count, uuids: [...]. 400 on a bad version, 400 on v5
+    without ?name=, 422 on count out of range.
+    """
+    import uuid as _uuid
+    version = (request.values.get("version") or "v4").strip().lower()
+    try:
+        count = max(1, min(1000, int(request.values.get("count") or 1)))
+    except (ValueError, TypeError):
+        count = 1
+
+    if version not in ("v1", "v4", "v5"):
+        return jsonify(error="invalid_version",
+                       detail="use ?version=v1|v4|v5"), 400
+
+    names_map = {
+        "dns": _uuid.NAMESPACE_DNS,
+        "url": _uuid.NAMESPACE_URL,
+        "oid": _uuid.NAMESPACE_OID,
+        "x500": _uuid.NAMESPACE_X500,
+    }
+    if version == "v5":
+        ns_raw = (request.values.get("namespace") or "dns").strip()
+        name = request.values.get("name")
+        if not name:
+            return jsonify(error="v5_requires_name",
+                           detail="pass ?name=<string> for v5"), 400
+        low = ns_raw.lower()
+        if low in names_map:
+            namespace = names_map[low]
+        else:
+            try:
+                namespace = _uuid.UUID(ns_raw)
+            except (ValueError, AttributeError, TypeError):
+                return jsonify(error="invalid_namespace",
+                               detail="use dns/url/oid/x500 or a UUID string"), 400
+        uuids = [str(_uuid.uuid5(namespace, name)) for _ in range(count)]
+    elif version == "v1":
+        uuids = [str(_uuid.uuid1()) for _ in range(count)]
+    else:  # v4
+        uuids = [str(_uuid.uuid4()) for _ in range(count)]
+
+    out = {
+        "version": version,
+        "count": len(uuids),
+        "uuids": uuids,
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "uuid:%s:%d" % (version, count))
+    return jsonify(out)
 
 
 if __name__ == "__main__":

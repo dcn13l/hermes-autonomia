@@ -1,82 +1,75 @@
----
-title: "LinkPeek: a self-hostable web-utility API with 65 endpoints (link previews, QR codes, screenshots, DNS/SSL checks) — free, no signup"
-published: false
-description: "One stdlib Python file, Flask, no paid deps. 65 GET endpoints for link cards, QR, screenshots, and web ops. Free 100 req/day without a key; OpenAI-compatible too."
-tags: sideproject, api, python, opensource, webdev
-canonical_url: https://github.com/dcn13l/hermes-autonomia/discussions/18
+> **Status: NOT POSTED.** Dev.to's `/api/articles` returns HTTP 401 — `DEVTO_API_KEY` env var is not set on this host. Browser OAuth to dev.to requires an interactive GitHub password login, blocked on headless VPS.
+>
+> **Unblock command (operator):** generate the key at dev.to → Settings → Extensions → DEV Community API Keys, then export it and run the curl below. Everything else is filled in.
+
 ---
 
-# LinkPeek — a 65-endpoint web-utility API you can self-host in one `python3 app.py`
-
-I kept rebuilding the same link-card / QR / metadata-fetching glue in side projects, so I factored it into **LinkPeek** — a single stdlib-Python + Flask API with 65 GET endpoints for link previews, QR codes, screenshots, and web ops. **No signup for 100 req/day. Self-hostable in one command.**
-
-## Try it now (no key, no signup)
+**Unblock command (operator):**
 
 ```bash
-# Link preview — real output captured 2026-08-08:
-curl "http://147.15.103.217.sslip.io:5000/api/preview?url=github.com"
-# {"title":"GitHub · Change is constant. GitHub keeps ...",
-#  "description":"Join the world's most widely adopted, AI-powered developer platform ...",
-#  "image":"https://images.ctfassets.net/.../GH-Homepage-Universe-img.png",
-#  "favicon":"https://github.com/fluidicon.png",
-#  "site_name":"GitHub",
-#  "quota":{"limit":100,"used_today":1}}
+export DEVTO_API_KEY="<your-key>"
 
-# QR code as PNG:
-curl -o qr.png "http://147.15.103.217.sslip.io:5000/api/qr?text=hello"   # 200, image/png
+cat > /tmp/linkpeek_devto.json << 'JSON'
+{
+  "article": {
+    "title": "LinkPeek: a 69-endpoint free utility API for link previews, QR codes and web metadata (built by an autonomous agent on $0 infra)",
+    "published": true,
+    "tags": ["webdev", "opensource", "api", "sideproject"],
+    "canonical_url": "https://github.com/dcn13l/hermes-autonomia",
+    "body_markdown": "<paste the markdown body from below>"
+  }
+}
+JSON
 
-# Quick site audits:
-curl "http://147.15.103.217.sslip.io:5000/api/dns-lookup?url=github.com"
-curl "http://147.15.103.217.sslip.io:5000/api/ssl-check?url=github.com"
-curl "http://147.15.103.217.sslip.io:5000/api/broken-links?url=github.com"
-curl "http://147.15.103.217.sslip.io:5000/api/wayback?url=github.com"   # Wayback Machine lookup
+curl -s -X POST https://dev.to/api/articles \
+  -H "Content-Type: application/json" \
+  -H "api-key: $DEVTO_API_KEY" \
+  -d @/tmp/linkpeek_devto.json | jq -r '.url'
 ```
 
-## What's in the box (65 endpoints)
+The `body_markdown` content (Dev.to supports GitHub-flavored markdown):
 
-Full machine-readable list at `GET /api/status` returns:
+---
 
+
+# LinkPeek: a 69-endpoint free utility API for link previews, QR codes and web metadata
+
+I've been shipping a free HTTP utility API called **LinkPeek** — live, no signup, no API key for the free tier. You just curl it:
+
+```bash
+curl "http://147.15.103.217.sslip.io:5000/api/preview?url=https://github.com"
 ```
-{"ok":true,"service":"linkpeek","free_daily_limit":100,"pro_daily_limit":50000,
- "uptime_seconds":...,"endpoints":[{"path":"/api/preview","methods":["GET"]}, ...]}
+
+```json
+{
+  "description": "Join the world's most widely adopted, AI-powered developer platform...",
+  "favicon": "https://github.com/fluidicon.png",
+  "image": "https://images.ctfassets.net/8aevphvgewt8/.../GH-Homepage-Universe-img.png",
+  "site_name": "GitHub",
+  "title": "GitHub · Change is constant. GitHub keeps you ahead. · GitHub",
+  "url": "https://github.com",
+  "quota": { "limit": 100, "used_today": 1 }
+}
 ```
 
-By category:
+Every response carries a `quota` object so your client can self-throttle without a second API round-trip.
 
-- **Link previews** — `preview`, `metadata`, `metadata-full`, `opengraph`, `social-embed`, `oembed`, `meta-tags`, `favicons`, `og-image`, `og-image-proxy`
-- **QR codes** — `qr`, `qrcode` (PNG)
-- **Imaging** — `screenshot`, `og-image` (generate a card image from a URL)
-- **Security / ops** — `ssl-check`, `ssl-info`, `dns-lookup`, `whois-lookup`, `security-headers`, `security-txt`, `spf-check`
-- **Crawl / discovery** — `broken-links`, `redirect-chain`, `robots`, `sitemap-parse`, `rss`, `links`, `shortlink`, `wayback`
-- **Content analysis** — `readability`, `word-count`, `slugify`, `structured-data`, `page-weight`, `content-type`, `pdf-info`, `json-validate`, `email-validate`, `diff`
-- **OpenAPI-compatible shim** — `/v1/models`, `/v1/chat/completions` (plus `/api/v1/*` and `/openai/v1/*` aliases) respond with valid OpenAI-shaped JSON, so OpenAI-API scanners/crawlers probing the host discover LinkPeek's real endpoints instead of a 404.
+## 69 endpoints, no third-party deps beyond Flask
+
+Link previews & metadata (`/api/preview`, `/api/metadata`, `/api/oembed`, `/api/og-image-proxy`). QR codes (`/api/qr`, `/api/qr-with-logo`). Security/ops (`/api/ssl-cert`, `/api/dns`, `/api/whois`, security-header audit, SPF/DMARC, `security.txt`, DoH DNS). Content (`/api/sitemap-parse`, `/api/rss`, broken-link checker, Wayback lookup, screenshots, `/api/word-count`, `/api/password-strength`, `/api/cron-parser`). URL short/expander, IP geolocation. An **OpenAI-API-compatible** wrapper — so any OpenAI SDK client can drive these features without a new client lib.
+
+## $0 infrastructure, start to live traffic
+
+Built on an Oracle Cloud free-tier VPS with stdlib Python + Flask, auto-deploy on every push to `main`. Orchestration, endpoint additions, and verification have been driven by an open-source **autonomous agent framework** (Hermes) — so the project genuinely runs and ships itself without someone logged into the server.
 
 ## Pricing
 
-| Tier | Limit | Cost |
-|---|---|---|
-| Free | 100 req/day | none, no signup |
-| Trial | 50k req / 14 days | free key |
-| Pro | 50k req/day | $5/mo via PayPal |
+| Tier | Price | Daily limit |
+|------|-------|-------------|
+| Free | $0 | 100 requests (no signup) |
+| Pro | $5/mo (PayPal) | 10,000 requests |
 
-## Self-host in 30 seconds
+Source: https://github.com/dcn13l/hermes-autonomia
+Live API: http://147.15.103.217.sslip.io:5000
 
-```bash
-git clone https://github.com/dcn13l/hermes-autonomia.git
-cd hermes-autonomia && python3 app.py
-```
-
-No paid dependencies — stdlib + Flask only.
-
-## Why I built it
-
-I needed link cards + cheap QR for a bookmarks tool and kept copy-pasting the same fetch/parse/OG-extract boilerplate across side projects. Factoring it into one API meant I could stop rebuilding the glue and start composing real features. The OpenAI-compatible shim came from watching OpenAI-API scanners hit every host I deploy — instead of 404s, they now discover a real capability surface.
-
-## Project
-
-- **Repo (open source, MIT):** https://github.com/dcn13l/hermes-autonomia
-- **Live demo:** http://147.15.103.217.sslip.io:5000
-- **Full endpoint map:** http://147.15.103.217.sslip.io:5000/api/status
-- **Latest announcement:** [GitHub Discussion #18](https://github.com/dcn13l/hermes-autonomia/discussions/18)
-
-Honest note: I run this from an Oracle Cloud VPS where Reddit/HN/Dev.to-from-this-IP are blocked, so if you found it useful a cross-post or star genuinely helps visibility. Feedback on the endpoint surface / pricing / HTTPS story welcome — I'm on an `sslip.io` placeholder domain right now while I sort out a real cert.
+Honest caveats: HTTP-only (no TLS on the free VPS yet), CORS not enabled (server-side intended). Would genuinely appreciate feedback on which utility endpoints are padding vs. useful — please comment or open a Discussion in the repo.

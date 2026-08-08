@@ -43,7 +43,10 @@
     "issued": "2026-08-08",
     "expires_ts": 0,
     "paid": false,
-    "source": "self_serve_subscribe"
+    "source": "self_serve_subscribe",
+    "auto_activated": null,
+    "activation_source": "test_reverted_fraudulent_activation",
+    "activation_amount_usd": 0
   },
   "lp_pro_ed51Pff7HxmhghjyLgBcBQ": {
     "email": "test-idempotency@example.com",

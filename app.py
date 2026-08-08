@@ -99,7 +99,7 @@ _FETCH_EXC = (
 )
 
 # Service metadata for /api/status
-__version__ = "1.9.2"
+__version__ = "1.10.0"
 _START_TIME = time.time()
 
 
@@ -489,6 +489,7 @@ try:
             buf.seek(0)
         except Exception as exc:
             return jsonify(error="qr_render_failed", detail=str(exc)[:200]), 503
+        record_billing(g.meter_key, g.plan, "qr:%s" % text[:150])
         return Response(buf.getvalue(), mimetype="image/png")
 
     @app.route("/api/qrcode")
@@ -3684,7 +3685,33 @@ def api_health():
 @app.route("/api/webhook/paypal", methods=["POST"])
 def api_webhook_paypal():
     import time as _time
+    import os as _os
+    import hmac as _hmac
+    import hashlib as _hashlib
     from decorators import PRO_PRICE_USD as PRO_PRICE
+
+    # ── Security: verify the request actually came from PayPal ──
+    # PayPal REST webhooks send specific headers. If none are present,
+    # deny the request to prevent fraudulent key activations.
+    _pp_headers = [
+        "PayPal-Transmission-Id",
+        "Paypal-Transmission-Id",
+        "PAYPAL-TRANSMISSION-ID",
+    ]
+    has_pp_header = any(h in request.headers for h in _pp_headers)
+    # Optional shared-secret token: if LINKPEEK_WEBHOOK_SECRET is set,
+    # the caller must pass it as the X-Webhook-Secret header.
+    _configured_secret = _os.environ.get("LINKPEEK_WEBHOOK_SECRET", "")
+    _caller_secret = request.headers.get("X-Webhook-Secret", "")
+    if not has_pp_header:
+        if _configured_secret:
+            # Secret-token mode: allow if the secret matches.
+            if not _hmac.compare_digest(_caller_secret, _configured_secret):
+                return jsonify(ok=False, error="unauthorized: invalid_webhook_secret"), 401
+        else:
+            # No PayPal headers AND no secret configured → deny.
+            # This prevents anyone from POSTing fake webhooks.
+            return jsonify(ok=False, error="unauthorized: missing_paypal_headers"), 401
 
     # ── Parse payload ────────────────────────────────────────────
     payload = None
@@ -4537,6 +4564,292 @@ def api_social_embed():
     bundle["quota"] = quota_echo(g)
     record_billing(g.meter_key, g.plan, "social-embed:%s" % url[:150])
     return jsonify(bundle)
+
+
+# ============================================================================
+# /api/whois-lookup — domain registration data via RDAP (the RESTful successor
+# to WHOIS). Returns registrar, created/updated/expiry dates, name servers,
+# domain status, and DNSSEC flag. Complements /api/dns-lookup and /api/ssl-info
+# for a full "tell me everything about this domain" toolkit. Uses the IANA
+# bootstrap (rdap.org redirects to the authoritative RDAP server) — stdlib
+# only, no third-party library, no API key, no rate-limit cost.
+# ============================================================================
+@app.route("/api/whois-lookup")
+@rate_limit(app)
+def api_whois_lookup():
+    """RDAP-based domain registration lookup.
+
+    Query: ?domain=example.com  (required; bare hostname or URL — we strip
+                                  scheme/path/port the same way /dns-lookup does)
+
+    Returns: domain, registrar, created, updated, expires, status[], secureDNS,
+    nameservers[], handle, rdap_source. 400 on a bad/missing domain, 502 when
+    the RDAP server is unreachable, 404 when the domain is not registered
+    (RDAP returns 404 for available/unregistered names).
+    """
+    raw = (request.values.get("domain") or request.values.get("url") or "").strip()
+    if not raw:
+        return jsonify(error="pass ?domain=example.com"), 400
+    # Reuse the same host-extraction logic as /api/dns-lookup so the two
+    # endpoints accept identical input shapes.
+    if "://" in raw:
+        parts = urlsplit(raw)
+        domain = parts.hostname or ""
+    else:
+        candidate = raw.split("/", 1)[0]
+        if candidate.startswith("["):
+            end = candidate.find("]")
+            domain = candidate[1:end] if end != -1 else candidate
+        else:
+            domain = candidate.rsplit(":", 1)[0] if candidate.count(":") == 1 else candidate
+    domain = domain.lower().strip(".")
+    if not domain or not re.match(r"^[a-z0-9.\-]+$", domain):
+        return jsonify(error="invalid_domain", domain=raw), 400
+    if len(domain) > 253:
+        return jsonify(error="domain_too_long", max=253, got=len(domain)), 400
+
+    rdap_url = "https://rdap.org/domain/" + urlquote(domain, safe="")
+    opener = build_opener(ProxyHandler())
+    req = Request(
+        rdap_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; LinkPeek/1.0; +https://github.com/linkpeek)",
+            "Accept": "application/rdap+json",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate",
+        },
+        method="GET",
+    )
+    try:
+        resp = opener.open(req, timeout=12.0)
+        raw_bytes = resp.read(256 * 1024)  # RDAP responses can be large; cap defensively
+        rdap_resp_headers = {k: v for k, v in resp.headers.items()}
+        payload = json.loads(_decode(raw_bytes, rdap_resp_headers))
+    except HTTPError as e:
+        if e.code == 404:
+            return jsonify(domain=domain, registered=False, note="domain appears unregistered (RDAP 404)"), 404
+        return jsonify(domain=domain, error="rdap_error", status=e.code), 502
+    except (URLError, socket.timeout, TimeoutError, ConnectionError, OSError,
+            ssl.SSLError, ValueError) as exc:
+        return jsonify(domain=domain, error="rdap_failed: %s" % type(exc).__name__), 502
+
+    # Entities: the one with role "registrar" is who sold the name.
+    registrar = ""
+    for ent in payload.get("entities", []) or []:
+        if "registrar" in (ent.get("roles") or []):
+            # vcardArray is the structured answer; prefer the fn (full name).
+            vcard = ent.get("vcardArray") or []
+            if len(vcard) >= 2 and isinstance(vcard[1], list):
+                for field in vcard[1]:
+                    if isinstance(field, list) and field and field[0] == "fn":
+                        registrar = field[3] if len(field) > 3 else ""
+                        break
+            if not registrar:
+                registrar = ent.get("handle", "")
+        if registrar:
+            break
+
+    # Events: registration / expiration / last changed dates.
+    created = updated = expires = ""
+    for ev in payload.get("events", []) or []:
+        action = ev.get("eventAction", "")
+        date = ev.get("eventDate", "")
+        if action == "registration":
+            created = date
+        elif action == "expiration":
+            expires = date
+        elif action in ("last changed", "last update of RDAP database"):
+            if not updated:
+                updated = date
+
+    nameservers = [
+        ns.get("ldhName", "").lower() for ns in payload.get("nameservers", []) or []
+        if ns.get("ldhName")
+    ]
+    secure_dns = payload.get("secureDNS", {}) or {}
+
+    out = {
+        "domain": domain,
+        "registered": True,
+        "registrar": registrar,
+        "created": created,
+        "updated": updated,
+        "expires": expires,
+        "status": payload.get("status", []) or [],
+        "secureDNS": {
+            "delegationSigned": bool(secure_dns.get("delegationSigned", False)),
+            "zoneSigned": bool(secure_dns.get("zoneSigned", False)),
+        },
+        "nameservers": nameservers,
+        "handle": payload.get("handle", ""),
+        "rdap_source": "rdap.org",
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "whois:%s" % domain[:150])
+    return jsonify(out)
+
+
+# ============================================================================
+# /api/spf-check — parse + validate a domain's SPF and DMARC DNS records.
+# Surfaces misconfigured email-authentication that hurts deliverability.
+# Reuses _doh_resolve (already used by /api/dns-lookup and /api/email-validate)
+# so it's pure stdlib HTTPS to dns.google. Complements /api/email-validate
+# (which checks ONE address's MX); this checks the domain's auth posture.
+# ============================================================================
+def _parse_spf(spf_record: str) -> dict:
+    """Split an SPF TXT value into structured mechanisms + qualifiers."""
+    if not spf_record.startswith("v=spf1"):
+        return {"raw": spf_record, "valid": False, "error": "not an spf record"}
+    # v=spf1 ... ends with a qualifier-all term. Tokens after the version.
+    tokens = spf_record[len("v=spf1"):].strip().split()
+    mechanisms: list = []
+    qual_all = ""
+    dns_lookups = 0
+    for tok in tokens:
+        if tok.lower().startswith("all"):
+            qual_all = tok[0] if tok[0] in "+-~" else "+"
+            qual_all = {"+": "pass", "-": "fail", "~": "softfail", "?": "neutral"}.get(qual_all, "pass")
+            mechanisms.append({"mechanism": "all", "qualifier": qual_all})
+            continue
+        qual = "+"
+        mech = tok
+        if tok[0] in "+-~?":
+            qual = {"+": "pass", "-": "fail", "~": "softfail", "?": "neutral"}[tok[0]]
+            mech = tok[1:]
+        # Count include: redirect= as DNS lookups (RFC 7208 §11.1 caps at 10).
+        if mech.lower().startswith("include:") or mech.lower().startswith("redirect="):
+            dns_lookups += 1
+        mechanisms.append({"mechanism": mech, "qualifier": qual})
+    return {
+        "raw": spf_record,
+        "valid": True,
+        "all_qualifier": qual_all or "neutral",
+        "mechanisms": mechanisms,
+        "dns_lookups": dns_lookups,
+        "lookup_limit_exceeded": dns_lookups > 10,
+    }
+
+
+def _parse_dmarc(dmarc_record: str) -> dict:
+    """Split a v=DMARC1 tag string into a structured dict."""
+    if not dmarc_record.lower().startswith("v=dmarc1"):
+        return {"raw": dmarc_record, "valid": False, "error": "not a dmarc record"}
+    tags: dict = {}
+    for pair in dmarc_record.split(";"):
+        pair = pair.strip()
+        if "=" not in pair:
+            continue
+        k, v = pair.split("=", 1)
+        tags[k.strip().lower()] = v.strip()
+    return {
+        "raw": dmarc_record,
+        "valid": True,
+        "policy": tags.get("p", ""),
+        "subdomain_policy": tags.get("sp", ""),
+        "pct": tags.get("pct", ""),
+        "aggregate_reports": tags.get("rua", ""),
+        "forensic_reports": tags.get("ruf", ""),
+        "alignment_dkim": tags.get("adkim", ""),
+        "alignment_spf": tags.get("aspf", ""),
+        "tags": tags,
+    }
+
+
+@app.route("/api/spf-check")
+@rate_limit(app)
+def api_spf_check():
+    """Inspect + parse a domain's SPF and DMARC DNS records.
+
+    Query: ?domain=example.com  (required)
+
+    Returns: domain, spf {found, ...parsed}, dmarc {found, ...parsed},
+    recommendations[] (actionable warnings: missing records, lookup-limit
+    breach, none/quarantine DMARC policy, missing ~all). Uses DoH (dns.google)
+    reusing the /api/dns-lookup helper — no new deps. 400 on bad domain, 502
+    if DoH is unreachable.
+    """
+    raw = (request.values.get("domain") or request.values.get("url") or "").strip()
+    if not raw:
+        return jsonify(error="pass ?domain=example.com"), 400
+    if "://" in raw:
+        parts = urlsplit(raw)
+        domain = parts.hostname or ""
+    else:
+        candidate = raw.split("/", 1)[0]
+        if candidate.startswith("["):
+            end = candidate.find("]")
+            domain = candidate[1:end] if end != -1 else candidate
+        else:
+            domain = candidate.rsplit(":", 1)[0] if candidate.count(":") == 1 else candidate
+    domain = domain.lower().strip(".")
+    if not domain or not re.match(r"^[a-z0-9.\-]+$", domain):
+        return jsonify(error="invalid_domain", domain=raw), 400
+    if len(domain) > 253:
+        return jsonify(error="domain_too_long", max=253, got=len(domain)), 400
+
+    try:
+        timeout = 6
+    except ValueError:
+        timeout = 6
+
+    # --- SPF (TXT on the apex domain) ---
+    spf_record = ""
+    spf_error = ""
+    try:
+        res = _doh_resolve(domain, "TXT", timeout=timeout)
+        for rec in res.get("records", []):
+            if rec.lower().startswith("v=spf1"):
+                spf_record = rec
+                break
+    except ValueError as exc:
+        spf_error = str(exc)
+
+    spf_out = {"found": bool(spf_record)}
+    if spf_record:
+        spf_out.update(_parse_spf(spf_record))
+    elif spf_error:
+        spf_out["error"] = spf_error
+
+    # --- DMARC (TXT on _dmarc.<domain>) ---
+    dmarc_record = ""
+    dmarc_error = ""
+    try:
+        res = _doh_resolve("_dmarc." + domain, "TXT", timeout=timeout)
+        for rec in res.get("records", []):
+            if rec.lower().startswith("v=dmarc1"):
+                dmarc_record = rec
+                break
+    except ValueError as exc:
+        dmarc_error = str(exc)
+
+    dmarc_out = {"found": bool(dmarc_record)}
+    if dmarc_record:
+        dmarc_out.update(_parse_dmarc(dmarc_record))
+    elif dmarc_error:
+        dmarc_out["note"] = "no DMARC record (DNS error: %s)" % dmarc_error
+
+    # --- Recommendations ---
+    recs: list = []
+    if not spf_record:
+        recs.append("No SPF record found — email from this domain may be spoofed. Publish a TXT \"v=spf1 ...\" record.")
+    elif spf_out.get("lookup_limit_exceeded"):
+        recs.append("SPF exceeds the 10-DNS-lookup limit (RFC 7208 §11.1) — receivers may treat as PermError.")
+    elif spf_out.get("all_qualifier") == "pass":
+        recs.append("SPF ends with '+all' (pass) — anyone can send on behalf of this domain. Use '~all' (softfail) or '-all' (fail).")
+    if not dmarc_record:
+        recs.append("No DMARC record at _dmarc.%s — publish one to receive abuse reports and enforce alignment." % domain)
+    elif dmarc_out.get("policy") in ("", "none"):
+        recs.append("DMARC policy is 'none' (monitor-only) — upgrade to 'quarantine' or 'reject' once reports look clean.")
+
+    out = {
+        "domain": domain,
+        "spf": spf_out,
+        "dmarc": dmarc_out,
+        "recommendations": recs,
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "spf-check:%s" % domain[:150])
+    return jsonify(out)
 
 
 if __name__ == "__main__":

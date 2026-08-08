@@ -70,5 +70,13 @@
     "issued": "2026-08-08",
     "expires": "2026-08-22",
     "expires_ts": 1787377819
+  },
+  "lp_pro_rteuuOowz2nkDTS8FZkZ2w": {
+    "email": "test@linkpeek.com",
+    "plan": "pro",
+    "issued": "2026-08-08",
+    "expires_ts": 0,
+    "paid": false,
+    "source": "self_serve_subscribe"
   }
 }

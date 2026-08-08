@@ -5414,6 +5414,109 @@ def api_slugify():
     return jsonify(out)
 
 
+# ============================================================================
+# OpenAI-compatible API surface (stub)
+#
+# Crawlers/scanners routinely probe /v1/models, /v1/chat/completions, /openai/…,
+# /api/v1/…, and /health. Instead of returning bare 404s we serve a faithful
+# stub of the OpenAI API shape that (a) advertises LinkPeek's actual endpoints
+# as a custom model family, (b) echoes a valid /v1/models list so discovery
+# tools classify us, and (c) accepts /v1/chat/completions and returns a helpful
+# non-AI completion explaining the real API, so the traffic is *captured*
+# rather than wasted. No paid deps, no LLM call — pure description.
+# ============================================================================
+@app.route("/v1/models")
+@app.route("/openai/v1/models")
+@app.route("/api/v1/models")
+def openai_models():
+    """OpenAI-compatible GET /v1/models stub.
+
+    Returns the standard OpenAI ``{object: "list", data: [...]}`` envelope so
+    discovery/crawler tools that scan for OpenAI APIs register us as a valid
+    provider. Each ``data`` entry describes a LinkPeek capability advertised
+    as a pseudo-model id (e.g. ``linkpeek-preview``). This is not a real LLM —
+    it is a service catalogue that happens to speak the /v1/models shape.
+    """
+    now = int(time.time())
+    models = [
+        {
+            "id": "linkpeek-preview",
+            "object": "model",
+            "created": now,
+            "owned_by": "linkpeek",
+            "capability": "link-preview extraction — GET /api/preview?url=",
+        },
+        {
+            "id": "linkpeek-metadata",
+            "object": "model",
+            "created": now,
+            "owned_by": "linkpeek",
+            "capability": "full metadata dump — GET /api/metadata?url=",
+        },
+        {
+            "id": "linkpeek-qr",
+            "object": "model",
+            "created": now,
+            "owned_by": "linkpeek",
+            "capability": "QR code PNG generation — GET /api/qr?text=",
+        },
+        {
+            "id": "linkpeek-tech-stack",
+            "object": "model",
+            "created": now,
+            "owned_by": "linkpeek",
+            "capability": "framework/CMS fingerprinting — GET /api/tech-stack?url=",
+        },
+    ]
+    return jsonify(object="list", data=models)
+
+
+@app.route("/v1/chat/completions", methods=["POST"])
+@app.route("/openai/v1/chat/completions", methods=["POST"])
+@app.route("/api/v1/chat/completions", methods=["POST"])
+def openai_chat_completions():
+    """OpenAI-compatible POST /v1/chat/completions stub.
+
+    Accepts the standard request body (model, messages) and returns a valid
+    OpenAI chat-completion response envelope whose assistant message is a
+    concise, helpful message explaining that LinkPeek is a link-preview / QR
+    API, not an LLM, and listing the real REST endpoints. This *captures* the
+    automated scanner traffic with a useful response instead of a 404, and is
+    harmless (no model is loaded, no cost incurred). Intentionally does NOT
+    echo the user's messages back or attempt any real generation.
+    """
+    import time as _time
+    body = {}
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        body = {}
+    model_req = body.get("model", "linkpeek-preview")
+    help_text = (
+        "LinkPeek is a link-preview and QR-code REST API, not a chat LLM. "
+        "This /v1/chat/completions endpoint is a compatibility stub. "
+        "Real endpoints: /api/preview?url=, /api/metadata?url=, /api/qr?text=, "
+        "/api/tech-stack?url=, /api/dns-lookup?domain=. "
+        "Full catalogue: GET /api/status. Docs: https://linkpeek.dev"
+    )
+    now = int(_time.time())
+    completion = {
+        "id": "chatcmpl-linkpeek-%d" % now,
+        "object": "chat.completion",
+        "created": now,
+        "model": model_req,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": help_text},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+    return jsonify(completion)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)

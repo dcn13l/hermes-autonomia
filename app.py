@@ -38,6 +38,8 @@ Single Flask app. Endpoints:
     GET  /api/ssl-check        TLS cert expiry/issuer summary + days-until-expiry
     GET  /api/security-txt    fetch + parse RFC 9116 /.well-known/security.txt
     GET  /api/wayback        Internet Archive Wayback Machine snapshot lookup
+    GET  /api/perf-timing    server-side TTFB + download time + total bytes for a URL
+    GET  /api/slugify        slugify a text string into a URL-safe slug
     GET  /lp/<code>            302-redirect for a short code
 """
 
@@ -102,7 +104,7 @@ _FETCH_EXC = (
 )
 
 # Service metadata for /api/status
-__version__ = "1.12.0"
+__version__ = "1.13.0"
 _START_TIME = time.time()
 
 
@@ -3987,7 +3989,6 @@ _EMAIL_RE = re.compile(
 
 
 @app.route("/api/email-validate")
-@app.route("/api/emaill-validate")  # tolerate the documented typo
 @rate_limit(app)
 def api_email_validate():
     """Validate one email address for syntax (RFC 5322 subset) + MX records.
@@ -5114,7 +5115,7 @@ def api_security_txt():
 
 
 # ============================================================================
-# /api/wayback — Internet Archive Wayback Machine snapshot lookup (1.12.0).
+# /api/wayback — Internet Archive Wayback Machine snapshot lookup (1.12.0+)
 # ============================================================================
 # Queries the free, public archive.org/wayback/available JSON API for the
 # closest archived snapshot of a URL. Useful for citation tools, recovering
@@ -5250,6 +5251,166 @@ def api_wayback():
         out["note"] = "No snapshots found in the Wayback Machine."
     out["quota"] = quota_echo(g)
     record_billing(g.meter_key, g.plan, "wayback:%s" % url[:150])
+    return jsonify(out)
+
+
+# ============================================================================
+# /api/perf-timing — server-side HTTP performance timing for a URL (1.13.0).
+# ============================================================================
+# Measures, from the LinkPeek server's perspective, the time-to-first-byte
+# (TTFB), total download time, total bytes received, and average throughput
+# for a public URL. Reuses _normalize_url for SSRF guard + _FETCH_EXC for
+# uniform error shape. Stdlib only — uses urllib opener with a 15s cap. This
+# gives a rough "how fast does this site load" signal without installing a
+# headless browser or a paid monitoring SaaS. Optional ?timeout= (1..15s).
+@app.route("/api/perf-timing")
+@rate_limit(app)
+def api_perf_timing():
+    """Measure server-side TTFB + download time + total bytes for a URL.
+
+    Query: ?url=https://...          (required; any public http/https URL)
+    Optional: ?timeout=10           fetch timeout in seconds (1..15, default 10)
+
+    Returns: url, status (HTTP status code or 0 on transport failure),
+    ttfb_ms (time to first byte in milliseconds), download_ms (time from first
+    byte to EOF), total_ms (TTFB + download), bytes (content length), and
+    kbps (average throughput). 400 on a missing/bad URL, 502 on fetch failure.
+    """
+    raw_url = (request.values.get("url") or "").strip()
+    if not raw_url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(raw_url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    try:
+        timeout = max(1, min(15, int(request.values.get("timeout") or 10)))
+    except (ValueError, TypeError):
+        timeout = 10
+
+    _UA = "Mozilla/5.0 (compatible; LinkPeek/1.0; +https://github.com/linkpeek)"
+    opener = build_opener(ProxyHandler())
+    total_bytes = 0
+    status = 0
+    ttfb_ms = 0.0
+    download_ms = 0.0
+    try:
+        req = Request(url, headers={"User-Agent": _UA}, method="GET")
+        t_start = time.time()
+        resp = opener.open(req, timeout=timeout)
+        status = resp.getcode() or 0
+        # Read in chunks so we can capture TTFB (first chunk) separately.
+        while True:
+            chunk = resp.read(64 * 1024)
+            if not chunk:
+                break
+            if not total_bytes:
+                ttfb_ms = (time.time() - t_start) * 1000.0
+            total_bytes += len(chunk)
+        t_end = time.time()
+        if not total_bytes:
+            # Empty body: TTFB is the whole time, download is 0.
+            ttfb_ms = (t_end - t_start) * 1000.0
+        else:
+            download_ms = (t_end - t_start) * 1000.0 - ttfb_ms
+    except _FETCH_EXC as e:
+        out = {"url": url, "error": "fetch_failed", "detail": str(e)[:200],
+               "status": status, "bytes": total_bytes,
+               "ttfb_ms": round(ttfb_ms, 2), "download_ms": round(download_ms, 2),
+               "total_ms": round(ttfb_ms + download_ms, 2)}
+        out["quota"] = quota_echo(g)
+        record_billing(g.meter_key, g.plan, "perf-timing:%s" % url[:150])
+        return jsonify(out), 502
+
+    total_ms = ttfb_ms + download_ms
+    kbps = (total_bytes / 1024.0 / (download_ms / 1000.0)) if download_ms > 0 else 0.0
+    out = {
+        "url": url,
+        "status": status,
+        "ttfb_ms": round(ttfb_ms, 2),
+        "download_ms": round(download_ms, 2),
+        "total_ms": round(total_ms, 2),
+        "bytes": total_bytes,
+        "kbps": round(kbps, 2),
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "perf-timing:%s" % url[:150])
+    return jsonify(out)
+
+
+# ============================================================================
+# /api/slugify — URL-safe slug from arbitrary text (1.13.0).
+# ============================================================================
+# Lowercases, strips non-alphanumerics, collapses runs of separator into single
+# hyphens, trims leading/trailing hyphens. Pure stdlib (re). Optional ?sep=
+# changes the separator (default "-"), ?maxlen= caps length (default 80, min 1,
+# max 200, trims on a hyphen boundary). Useful for generating stable URL slugs,
+# anchor IDs, and filenames from titles. No network calls.
+@app.route("/api/slugify")
+@rate_limit(app)
+def api_slugify():
+    """Slugify a text string into a URL-safe slug.
+
+    Query: ?text=Hello World!    (required; the text to slugify)
+    Optional: ?sep=-             separator character (default "-", must be a
+                                single non-alphanumeric character: - _ . ~)
+    Optional: ?maxlen=80         maximum slug length (1..200, default 80;
+                                truncated at the last separator boundary so
+                                the slug never ends mid-word or with a dangling
+                                separator)
+
+    Returns: text (original), slug (the slugified string), separator, truncated
+    (bool). 400 on a missing text or invalid separator.
+    """
+    text = request.values.get("text") or ""
+    sep = (request.values.get("sep") or "-").strip() or "-"
+    if not re.match(r"^[\-_.~]$", sep):
+        return jsonify(error="sep must be one of: - _ . ~"), 400
+    try:
+        maxlen = max(1, min(200, int(request.values.get("maxlen") or 80)))
+    except (ValueError, TypeError):
+        maxlen = 80
+
+    if not text:
+        return jsonify(error="pass ?text=..."), 400
+
+    # Lowercase, replace any run of non-alphanumeric chars with the separator,
+    # collapse consecutive separators, then trim.
+    raw = text.lower().strip()
+    raw = re.sub(r"[^a-z0-9]+", sep, raw)
+    # Collapse consecutive separators (in case sep appears doubled after the
+    # substitution above, though with a single-char sep this is belt-braces).
+    if sep:
+        raw = re.sub(re.escape(sep) + r"{2,}", sep, raw)
+    raw = raw.strip(sep)
+
+    if not raw:
+        # Entirely non-alphanumeric input → empty slug.
+        out = {
+            "text": text,
+            "slug": "",
+            "separator": sep,
+            "truncated": False,
+        }
+        out["quota"] = quota_echo(g)
+        record_billing(g.meter_key, g.plan, "slugify:%d" % len(text))
+        return jsonify(out)
+
+    truncated = False
+    if len(raw) > maxlen:
+        # Cut on the last separator at or before maxlen so we don't split a word.
+        cut = raw[:maxlen].rsplit(sep, 1)[0] if sep in raw[:maxlen] else raw[:maxlen]
+        raw = cut.rstrip(sep)
+        truncated = True
+
+    out = {
+        "text": text,
+        "slug": raw,
+        "separator": sep,
+        "truncated": truncated,
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "slugify:%d" % len(text))
     return jsonify(out)
 
 

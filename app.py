@@ -37,6 +37,7 @@ Single Flask app. Endpoints:
     GET  /api/social-embed     ready-to-paste social link-card bundle (OG+Twitter)
     GET  /api/ssl-check        TLS cert expiry/issuer summary + days-until-expiry
     GET  /api/security-txt    fetch + parse RFC 9116 /.well-known/security.txt
+    GET  /api/wayback        Internet Archive Wayback Machine snapshot lookup
     GET  /lp/<code>            302-redirect for a short code
 """
 
@@ -101,7 +102,7 @@ _FETCH_EXC = (
 )
 
 # Service metadata for /api/status
-__version__ = "1.11.0"
+__version__ = "1.12.0"
 _START_TIME = time.time()
 
 
@@ -218,11 +219,22 @@ def _decode(resp_bytes: bytes, headers) -> str:
                 pass
     elif enc == "br":
         # brotli is not stdlib; attempt import for environments that have it.
+        # NOTE: the original form ``except (ImportError, Exception)`` was a
+        # buggy catch-all — Exception already subsumes everything, so ImportError
+        # was dead weight and *any* error (incl. AttributeError from a non-brotli
+        # object) was silently swallowed. Split the two intents: ImportError
+        # means the brotli module is absent (leave data compressed, _decode will
+        # fall back to utf-8 ignore), and OSError covers decompress failures
+        # (corrupt/truncated brotli body) without masking unrelated bugs.
         try:
             import brotli  # type: ignore
-            data = brotli.decompress(data)
-        except (ImportError, Exception):
-            pass
+        except ImportError:
+            pass  # not installed — leave data untouched; decode ignores it
+        else:
+            try:
+                data = brotli.decompress(data)
+            except OSError:
+                pass  # corrupt brotli; fall back to the raw bytes
     charset = "utf-8"
     ctype = (headers.get("Content-Type") or "").lower()
     m = re.search(r"charset=([\w\-]+)", ctype)
@@ -5098,6 +5110,146 @@ def api_security_txt():
     }
     out["quota"] = quota_echo(g)
     record_billing(g.meter_key, g.plan, "security-txt:%s" % origin[:150])
+    return jsonify(out)
+
+
+# ============================================================================
+# /api/wayback — Internet Archive Wayback Machine snapshot lookup (1.12.0).
+# ============================================================================
+# Queries the free, public archive.org/wayback/available JSON API for the
+# closest archived snapshot of a URL. Useful for citation tools, recovering
+# dead/broken links, citation longevity, and viewing historical page state.
+# Zero budget — the archive.org API needs no key and has a generous rate
+# limit. Optional ?timestamp=YYYYMMDDhhmmss asks for the snapshot nearest a
+# specific moment; the API returns the closest available. Optional
+# ?snapshot_limit=N (1-20, default 5) requests additional recent snapshots
+# via a second /wayback/available call is not done here — instead we surface
+# the timemap via CDX to give N most-recent captures. Reuses _normalize_url
+# for SSRF guard + _FETCH_EXC for uniform error shape. Stdlib only.
+@app.route("/api/wayback")
+@rate_limit(app)
+def api_wayback():
+    """Find the most recent (or closest-in-time) Internet Archive snapshot.
+
+    Query: ?url=https://...          (required; any public http/https URL)
+    Optional: ?timestamp=YYYYMMDDhhmmss  (ISO-ish, digits-only; find the
+                                          snapshot nearest this moment)
+    Optional: ?limit=5             number of most-recent snapshots to also
+                                   return from the CDX timemap (1-20, default 5)
+
+    Returns: url (requested), archived_snapshots.closest {available, url,
+    timestamp, status}, snapshots: [{timestamp, status, url}] (recent captures
+    from the CDX API, most-recent first), archive_prefix (linkable base),
+    has_archive (bool). 400 on a missing/bad URL, 502 if archive.org is
+    unreachable, 404-shaped (has_archive=false) when no snapshot exists.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    timestamp = re.sub(r"\D", "", request.values.get("timestamp") or "")
+    try:
+        limit = max(1, min(20, int(request.values.get("limit") or 5)))
+    except (ValueError, TypeError):
+        limit = 5
+
+    opener = build_opener(ProxyHandler())
+    _UA = "Mozilla/5.0 (compatible; LinkPeek/1.0; +https://github.com/linkpeek)"
+    archive_prefix = "https://web.archive.org/web"
+
+    # --- Closest snapshot (official /wayback/available API) ---
+    avail_url = "https://archive.org/wayback/available?url=%s" % urlquote(
+        url, safe=""
+    )
+    if timestamp:
+        avail_url += "&timestamp=%s" % timestamp
+    closest = {"available": False, "url": "", "timestamp": "", "status": ""}
+    avail_ok = True
+    payload = {}
+    try:
+        req = Request(avail_url, headers={"User-Agent": _UA,
+                                          "Accept": "application/json"}, method="GET")
+        resp = opener.open(req, timeout=10.0)
+        raw = resp.read(128 * 1024)  # tiny JSON payload; cap defensively
+        payload = json.loads(raw.decode("utf-8", errors="ignore"))
+    except _FETCH_EXC:
+        avail_ok = False  # closest-snapshot lookup failed; try CDX below
+    if avail_ok:
+        snap = (payload.get("archived_snapshots") or {}).get("closest") or {}
+        if snap.get("available"):
+            closest = {
+                "available": True,
+                "url": snap.get("url", ""),
+                "timestamp": snap.get("timestamp", ""),
+                "status": str(snap.get("status", "")),
+            }
+        # If ?timestamp= was given but no closest returned, keep available=False.
+
+    # --- Recent snapshots via the CDX API (most-recent-first timemap) ---
+    # CDX returns one line per capture: key timestamp original mimetype
+    # statuscode digest length — tab-separated. We ask for the last `limit`
+    # in reverse-chron order. This complements /wayback/available which only
+    # returns the single closest hit, so callers get a small timeline.
+    snapshots: list = []
+    cdx_ok = True
+    cdx_url = (
+        "https://web.archive.org/cdx/search/cdx?url=%s"
+        "&output=json&limit=%d&fl=timestamp,original,statuscode,digest&"
+        "sort=desc" % (urlquote(url, safe=""), limit * 4)
+    )
+    try:
+        req = Request(cdx_url, headers={"User-Agent": _UA,
+                                        "Accept": "application/json"}, method="GET")
+        resp = opener.open(req, timeout=10.0)
+        raw = resp.read(256 * 1024)  # CDX rows are tiny but cap anyway
+        cdx_rows = json.loads(raw.decode("utf-8", errors="ignore"))
+    except _FETCH_EXC:
+        # _FETCH_EXC already includes ValueError (json.loads subsumed by it),
+        # so this single clause covers both transport failures and bad JSON.
+        cdx_ok = False
+        cdx_rows = []
+    # First row is the header ["timestamp","original","statuscode","digest"].
+    if cdx_ok and isinstance(cdx_rows, list) and len(cdx_rows) > 1:
+        for row in cdx_rows[1:][:limit]:
+            if not isinstance(row, list) or len(row) < 4:
+                continue
+            ts = str(row[0] or "")
+            original = str(row[1] or "")
+            sc = str(row[2] or "")
+            if not ts:
+                continue
+            snapshots.append({
+                "timestamp": ts,
+                "status": sc,
+                # Build the linkable playback URL so callers can open it.
+                "url": "%s/%s/%s" % (archive_prefix, ts,
+                                     original or url),
+            })
+
+    has_archive = closest["available"] or bool(snapshots)
+    out = {
+        "url": url,
+        "archive_prefix": archive_prefix,
+        "has_archive": has_archive,
+        "archived_snapshots": {"closest": closest},
+        "snapshots": snapshots,
+        "via": "archive.org",
+    }
+    if not avail_ok and not cdx_ok:
+        out["error"] = "archive_unreachable"
+        out["quota"] = quota_echo(g)
+        record_billing(g.meter_key, g.plan, "wayback:%s" % url[:150])
+        return jsonify(out), 502
+    if not has_archive:
+        # Both lookups worked but nothing archived. 404-shaped but still 200
+        # body (a success that found no data) is friendlier for monitoring
+        # tools that key on status codes; include has_archive=false instead.
+        out["note"] = "No snapshots found in the Wayback Machine."
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "wayback:%s" % url[:150])
     return jsonify(out)
 
 

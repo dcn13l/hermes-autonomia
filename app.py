@@ -35,6 +35,8 @@ Single Flask app. Endpoints:
     GET  /api/og-image         generate a placeholder 1200x630 OG image (PNG)
     GET  /api/json-validate    validate JSON syntax (?json= or ?url=src)
     GET  /api/social-embed     ready-to-paste social link-card bundle (OG+Twitter)
+    GET  /api/ssl-check        TLS cert expiry/issuer summary + days-until-expiry
+    GET  /api/security-txt    fetch + parse RFC 9116 /.well-known/security.txt
     GET  /lp/<code>            302-redirect for a short code
 """
 
@@ -99,7 +101,7 @@ _FETCH_EXC = (
 )
 
 # Service metadata for /api/status
-__version__ = "1.10.0"
+__version__ = "1.11.0"
 _START_TIME = time.time()
 
 
@@ -4706,20 +4708,25 @@ def _parse_spf(spf_record: str) -> dict:
     qual_all = ""
     dns_lookups = 0
     for tok in tokens:
-        if tok.lower().startswith("all"):
-            qual_all = tok[0] if tok[0] in "+-~" else "+"
-            qual_all = {"+": "pass", "-": "fail", "~": "softfail", "?": "neutral"}.get(qual_all, "pass")
-            mechanisms.append({"mechanism": "all", "qualifier": qual_all})
+        # Strip an optional qualifier prefix before checking the mechanism
+        # name, so that ``+all``, ``-all``, ``~all``, ``?all`` and bare
+        # ``all`` are all recognised as the ``all`` mechanism. The original
+        # code only checked ``tok.lower().startswith("all")`` which silently
+        # missed every qualified form (``+all``, ``-all``, ``~all``, ``?all``),
+        # leaving ``all_qualifier`` empty and causing the return expression
+        # ``qual_all or "neutral"`` to mis-report every qualifier as neutral.
+        qual_char = tok[0] if tok[0] in "+-~?" else "+"
+        mech_name = tok[1:] if tok[0] in "+-~?" else tok
+        qual_map = {"+": "pass", "-": "fail", "~": "softfail", "?": "neutral"}
+        qual = qual_map.get(qual_char, "pass")
+        if mech_name.lower() == "all":
+            qual_all = qual
+            mechanisms.append({"mechanism": "all", "qualifier": qual})
             continue
-        qual = "+"
-        mech = tok
-        if tok[0] in "+-~?":
-            qual = {"+": "pass", "-": "fail", "~": "softfail", "?": "neutral"}[tok[0]]
-            mech = tok[1:]
         # Count include: redirect= as DNS lookups (RFC 7208 §11.1 caps at 10).
-        if mech.lower().startswith("include:") or mech.lower().startswith("redirect="):
+        if mech_name.lower().startswith("include:") or mech_name.lower().startswith("redirect="):
             dns_lookups += 1
-        mechanisms.append({"mechanism": mech, "qualifier": qual})
+        mechanisms.append({"mechanism": mech_name, "qualifier": qual})
     return {
         "raw": spf_record,
         "valid": True,
@@ -4787,10 +4794,11 @@ def api_spf_check():
     if len(domain) > 253:
         return jsonify(error="domain_too_long", max=253, got=len(domain)), 400
 
-    try:
-        timeout = 6
-    except ValueError:
-        timeout = 6
+    # Per-record DoH timeout (seconds). Fixed at 6s which matches the default
+    # in _doh_resolve; the old code wrapped a bare ``timeout = 6`` assignment in
+    # a try/except ValueError that could never fire (int literal, no call) —
+    # dead noise left over from a refactored ``int(request.values.get(...))``.
+    timeout = 6
 
     # --- SPF (TXT on the apex domain) ---
     spf_record = ""
@@ -4849,6 +4857,247 @@ def api_spf_check():
     }
     out["quota"] = quota_echo(g)
     record_billing(g.meter_key, g.plan, "spf-check:%s" % domain[:150])
+    return jsonify(out)
+
+
+# ============================================================================
+# /api/ssl-check — certificate expiry/issuer summary with days-until-expiry.
+# Complements /api/ssl-info (which returns the full cert + protocol + cipher)
+# by focusing on the actionable question "how soon does this cert expire?"
+# Reuses _ssl_probe so it's pure stdlib. Adds a parsed datetime + an expiry
+# status bucket (valid / expiring_soon / expired / unknown) so monitoring
+# dashboards can alert without parsing RFC 2822 date strings themselves.
+# ============================================================================
+def _parse_cert_date(date_str: str):
+    """Parse an RFC 2822 ``notAfter`` string (e.g. 'Sep 15 23:59:59 2025 GMT').
+
+    Returns a timezone-aware UTC datetime, or None on failure. Uses
+    email.utils.parsedate_to_datetime which handles the exact format
+    ssl.getpeercert() emits.
+    """
+    if not date_str:
+        return None
+    from email.utils import parsedate_to_datetime
+    try:
+        dt = parsedate_to_datetime(date_str)
+        if dt is None:
+            return None
+        # parsedate_to_datetime may return a naive datetime if no tzinfo was
+        # present in the string; normalise to UTC so subtraction is safe.
+        if dt.tzinfo is None:
+            import datetime as _dt
+            dt = dt.replace(tzinfo=_dt.timezone.utc)
+        return dt
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+@app.route("/api/ssl-check")
+@rate_limit(app)
+def api_ssl_check():
+    """Certificate expiry + issuer summary for an https URL.
+
+    Query: ?url=https://...  (required; scheme must be https)
+    Optional: ?warn_days=30  (threshold for "expiring_soon" status; 1-365, default 30)
+    Returns: url, host, port, valid (bool), issuer (dict), subject (dict),
+    not_after (raw string), not_after_iso (ISO 8601, or null),
+    days_until_expiry (int, or null), expiry_status
+    ("valid" | "expiring_soon" | "expired" | "unknown"), warn_days.
+    400 on a non-https/bad URL, 502 if the TLS handshake fails.
+    """
+    import datetime as dt
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        warn_days = max(1, min(365, int(request.values.get("warn_days") or 30)))
+    except (ValueError, TypeError):
+        warn_days = 30
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    parts = urlsplit(url)
+    if parts.scheme.lower() != "https":
+        return jsonify(error="ssl-check requires an https URL"), 400
+    host = parts.hostname or ""
+    if not host:
+        return jsonify(error="invalid host"), 400
+    port = parts.port or 443
+    try:
+        probe = _ssl_probe(host, port)
+    except _FETCH_EXC as e:
+        return jsonify(url=url, error="fetch_failed: %s" % type(e).__name__), 502
+
+    not_after_raw = probe.get("not_after", "")
+    not_after_dt = _parse_cert_date(not_after_raw)
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    days_left: int | None = None
+    not_after_iso = ""
+    if not_after_dt is not None:
+        not_after_iso = not_after_dt.isoformat()
+        days_left = (not_after_dt - now_utc).days
+
+    # Expiry status bucket for alerting/monitoring.
+    if not probe["valid"]:
+        expiry_status = "unknown"  # we couldn't get a parsed cert
+    elif days_left is None:
+        expiry_status = "unknown"
+    elif days_left < 0:
+        expiry_status = "expired"
+    elif days_left <= warn_days:
+        expiry_status = "expiring_soon"
+    else:
+        expiry_status = "valid"
+
+    out = {
+        "url": url,
+        "host": host,
+        "port": port,
+        "valid": probe["valid"],
+        "issuer": probe["issuer"],
+        "subject": probe["subject"],
+        "not_after": not_after_raw,
+        "not_after_iso": not_after_iso or None,
+        "days_until_expiry": days_left,
+        "expiry_status": expiry_status,
+        "warn_days": warn_days,
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "ssl-check:%s" % host[:150])
+    return jsonify(out)
+
+
+# ============================================================================
+# /api/security-txt — fetch + parse a domain's RFC 9116 security.txt file.
+# security.txt lives at /.well-known/security.txt and standardises how
+# security researchers contact a site about vulnerabilities. This endpoint
+# fetches it (trying /.well-known/ first, then /security.txt as a fallback),
+# parses the key-value directives, and returns a structured dict — so a
+# bug-bounty dashboard or compliance tool can check "does this domain have
+# a security contact?" in one API call. Pure stdlib, reuses _normalize_url +
+# _fetch + _FETCH_EXC.
+# ============================================================================
+_SEC_TXT_MAX_BYTES = 256 * 1024  # security.txt is small; cap defensively.
+
+
+@app.route("/api/security-txt")
+@rate_limit(app)
+def api_security_txt():
+    """Fetch and parse a domain's RFC 9116 security.txt.
+
+    Query: ?url=https://...  (required; any http(s) URL — we extract the origin)
+    Returns: url, security_txt_url (the final fetched URL), found (bool),
+    fields (dict of parsed key→value pairs), contacts[] (all mailto/http URLs
+    found in the ``Contact`` field(s)), comments[] (lines starting with #),
+    raw (the full text, capped at 4096 chars). 404 if no security.txt is
+    found at either well-known location, 502 on fetch failure, 400 on a
+    bad/missing URL.
+    """
+    url = (request.values.get("url") or "").strip()
+    if not url:
+        return jsonify(error="pass ?url=https://..."), 400
+    try:
+        url = _normalize_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    parts = urlsplit(url)
+    origin = "%s://%s" % (parts.scheme, parts.netloc or parts.hostname or "")
+    if not parts.netloc:
+        return jsonify(error="invalid host"), 400
+
+    # Try the standard well-known location first, then the legacy root path.
+    candidates = [
+        origin + "/.well-known/security.txt",
+        origin + "/security.txt",
+    ]
+    opener = build_opener(ProxyHandler())
+    _UA = "Mozilla/5.0 (compatible; LinkPeek/1.0; +https://github.com/linkpeek)"
+    raw_text = ""
+    fetched_url = ""
+    fetch_error = ""
+    for cand in candidates:
+        req = Request(
+            cand,
+            headers={"User-Agent": _UA, "Accept": "text/plain, */*;q=0.8"},
+            method="GET",
+        )
+        try:
+            resp = opener.open(req, timeout=8.0)
+            raw_bytes = resp.read(_SEC_TXT_MAX_BYTES)
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            fetched_url = resp.geturl()
+            # Accept the body if it looks like text/plain or is parseable as
+            # utf-8; some misconfigured servers serve text/html wrappers.
+            raw_text = raw_bytes.decode("utf-8", errors="ignore")
+            if raw_text.strip():
+                break
+        except HTTPError as e:
+            # 404/403 just means this candidate doesn't have it; try the next.
+            if e.code in (404, 403):
+                continue
+            fetch_error = "http_%s" % e.code
+        except _FETCH_EXC as e:
+            fetch_error = "fetch_failed: %s" % type(e).__name__
+
+    if not raw_text.strip():
+        out = {
+            "url": url,
+            "origin": origin,
+            "found": False,
+            "fields": {},
+            "contacts": [],
+            "comments": [],
+            "raw": "",
+            "note": "No security.txt found at /.well-known/security.txt or /security.txt",
+        }
+        if fetch_error:
+            out["error"] = fetch_error
+            out["quota"] = quota_echo(g)
+            record_billing(g.meter_key, g.plan, "security-txt:%s" % origin[:150])
+            return jsonify(out), 502
+        out["quota"] = quota_echo(g)
+        record_billing(g.meter_key, g.plan, "security-txt:%s" % origin[:150])
+        return jsonify(out), 404
+
+    # Parse RFC 9116: line-oriented key: value (comments start with #).
+    fields: dict = {}
+    contacts: list = []
+    comments: list = []
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            comments.append(stripped[1:].strip())
+            continue
+        if ":" not in stripped:
+            continue
+        key, _, value = stripped.partition(":")
+        key = key.strip().lower()
+        value = value.strip()
+        if not key:
+            continue
+        # Multiple Contact fields are common; collect them all.
+        if key == "contact":
+            contacts.append(value)
+        # Later values for the same key overwrite earlier ones (last-wins,
+        # which matches RFC 9116 field semantics for single-valued fields).
+        fields[key] = value
+
+    out = {
+        "url": url,
+        "origin": origin,
+        "security_txt_url": fetched_url,
+        "found": True,
+        "fields": fields,
+        "contacts": contacts,
+        "comments": comments,
+        "raw": raw_text[:4096],
+        "raw_truncated": len(raw_text) > 4096,
+    }
+    out["quota"] = quota_echo(g)
+    record_billing(g.meter_key, g.plan, "security-txt:%s" % origin[:150])
     return jsonify(out)
 
 
